@@ -1,0 +1,81 @@
+%!PS-Adobe-3.0
+%%Title: CLP-620ND colour fidelity test page
+%%BoundingBox: 0 0 595 842
+%%EndComments
+/mm { 72 mul 25.4 div } def
+/Hel  { /Helvetica findfont exch scalefont setfont } def
+/HelB { /Helvetica-Bold findfont exch scalefont setfont } def
+/box { % x y w h -> filled rectangle
+  /bh exch def /bw exch def /by exch def /bx exch def
+  newpath bx by moveto bw 0 rlineto 0 bh rlineto bw neg 0 rlineto closepath fill } def
+/label { % x y str
+  0 setgray 8 Hel moveto show } def
+
+% --- title ---
+0 setgray 18 HelB
+20 mm 275 mm moveto (Samsung CLP-620ND - Colour Fidelity Test) show
+9 Hel 20 mm 268 mm moveto
+(PCL5c banded contone raster - if any band below is grey, colour is being discarded.) show
+
+% --- CMYK ramps ---
+/ramp { % y cyan magenta yellow black name
+  /nm exch def /kk exch def /yy exch def /mm_ exch def /cc exch def /yy0 exch def
+  0 1 10 {
+    /i exch def /t i 10 div def
+    cc t mul  mm_ t mul  yy t mul  kk t mul setcmykcolor
+    20 mm i 15 mm mul add  yy0  14 mm 12 mm box
+  } for
+  0 setgray 9 HelB 20 mm yy0 13 mm sub moveto nm show
+} def
+
+250 mm 1 0 0 0 (Cyan) ramp
+232 mm 0 1 0 0 (Magenta) ramp
+214 mm 0 0 1 0 (Yellow) ramp
+196 mm 0 0 0 1 (Black) ramp
+
+% --- RGB primaries and secondaries ---
+0 setgray 9 HelB 20 mm 185 mm moveto (RGB primaries and secondaries) show
+/sw { % x y r g b
+  setrgbcolor 24 mm 20 mm box } def
+20 mm  160 mm 1 0 0 sw
+48 mm  160 mm 0 1 0 sw
+76 mm  160 mm 0 0 1 sw
+104 mm 160 mm 0 1 1 sw
+132 mm 160 mm 1 0 1 sw
+160 mm 160 mm 1 1 0 sw
+
+% --- neutral wedge: reveals colour cast ---
+0 setgray 9 HelB 20 mm 150 mm moveto (Neutral grey wedge - should show no colour cast) show
+0 1 15 {
+  /i exch def i 15 div setgray
+  20 mm i 11 mm mul add 128 mm 10 mm 18 mm box
+} for
+
+% --- fine detail and text ---
+0 setgray 9 HelB 20 mm 118 mm moveto (Fine detail and coloured text) show
+1 0 0 0 setcmykcolor 12 HelB 20 mm 110 mm moveto (Cyan text 12pt) show
+0 1 0 0 setcmykcolor 12 HelB 20 mm 103 mm moveto (Magenta text 12pt) show
+0 0 1 0 setcmykcolor 12 HelB 20 mm  96 mm moveto (Yellow text 12pt on white) show
+0 0 0 1 setcmykcolor  6 Hel  20 mm  89 mm moveto (Black 6pt - the quick brown fox jumps over the lazy dog 0123456789) show
+
+% hairlines
+0 setgray
+0.25 setlinewidth
+0 1 20 { /i exch def newpath 20 mm i 2 mm mul add 60 mm moveto 0 20 mm rlineto stroke } for
+9 HelB 20 mm 56 mm moveto (0.25pt hairlines - should be crisp and unbroken) show
+
+% --- registration marks: margins and skew ---
+/reg { % x y
+  gsave translate 0 setgray 0.5 setlinewidth
+  newpath -5 mm 0 moveto 10 mm 0 rlineto stroke
+  newpath 0 -5 mm moveto 0 10 mm rlineto stroke
+  newpath 0 0 3 mm 0 360 arc stroke grestore } def
+15 mm 15 mm reg
+180 mm 15 mm reg
+15 mm 282 mm reg
+180 mm 282 mm reg
+
+0 setgray 8 Hel 20 mm 30 mm moveto
+(Registration marks sit 15 mm from each corner - use them to check margins and skew.) show
+showpage
+%%EOF

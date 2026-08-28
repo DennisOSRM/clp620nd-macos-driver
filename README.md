@@ -1,0 +1,190 @@
+# Samsung CLP-620ND — colour driver for macOS
+
+A CUPS driver that gets full-colour output from a Samsung CLP-620ND on stock
+macOS. No Ghostscript, no Homebrew, no runtime dependencies beyond what macOS
+already ships.
+
+## Why the stock setup prints black & white
+
+macOS matches this printer to Apple's `generpcl.ppd`, which declares:
+
+```
+*ColorDevice: False
+*DefaultColorSpace: Gray
+*cupsFilter: "application/vnd.cups-raster 50 rastertohp"
+*Resolution 600dpi: "<< /cupsBitsPerColor 1 /cupsColorSpace 3 >>"   # 3 = K only, 1 bit
+```
+
+Colour is discarded in the filter, before anything reaches the printer. The
+hardware was never the limitation.
+
+## How this driver works
+
+```
+app ──▶ PDF ──▶ cgpdftoraster ──▶ CUPS raster ──▶ rastertoclp620 ──▶ PCL5c ──▶ socket://…:9100
+                (stock macOS)      RGB 8-bit       (this driver)
+```
+
+`cgpdftoraster` is Apple's own rasteriser and already produces 8-bit RGB when
+the PPD asks for it. `rastertoclp620` is a small C program that turns those
+scanlines into PCL5c direct-RGB raster. Each row is encoded twice, with TIFF
+PackBits and with PCL delta-row, and the smaller result wins; the compression
+mode is switched per row. Delta-row matters because a row identical to the one
+above codes to nothing at all. It links against `libcups` only, so it has
+nothing to install alongside it.
+
+Page geometry, duplex, tray, media type, copies and toner save are set with
+PJL, using the enum spellings the firmware itself reports. PCL5c carries only
+the raster.
+
+### Why not PCL6?
+
+PCL5c was chosen over PCL6 because its direct-RGB raster escape sequences are
+simple and fully specified, whereas PCL-XL needs a binary operator and
+attribute encoder. Fidelity is identical: both carry 8-bit RGB pixels at the
+same resolution.
+
+## Install
+
+```sh
+make                                                  # builds a universal binary
+sudo ./scripts/install.sh [printer-ip] [queue-name]   # defaults: 192.168.179.180 CLP620ND
+./scripts/testprint.sh CLP620ND
+sudo ./scripts/uninstall.sh [queue-name]
+```
+
+Building needs the Xcode Command Line Tools. Running needs nothing.
+
+macOS seals `/usr/libexec/cups/filter` under SIP, so the filter installs to
+`/Library/Printers/Samsung/CLP-620ND/filter/` and the PPD's `cupsFilter2` line
+points at that absolute path. That directory is one the print sandbox allows.
+
+## Layout
+
+| path | purpose |
+|---|---|
+| `src/rastertoclp620.c` | the filter: CUPS raster to PCL5c |
+| `tools/genppd.sh` | generates the PPD — edit this, not the PPD |
+| `tools/pclxl-dis.py` | PCL-XL disassembler, kept from the PCL6 investigation |
+| `ppd/Samsung-CLP-620ND.ppd` | 16 paper sizes, colour, duplex, trays, media types |
+| `scripts/install.sh`, `uninstall.sh` | driver and queue management |
+| `scripts/probe.sh` | PJL queries, e.g. `./scripts/probe.sh 192.168.179.180 "INFO VARIABLES"` |
+| `scripts/testprint.sh` | print the colour test page |
+| `scripts/check-state.sh` | decode SNMP error bits, tray levels and supply percentages |
+| `tools/pcl5c-decode.py` | decode filter output back to PNG, to check pages without printing |
+| `test/testpage.pdf` | CMYK ramps, RGB swatches, grey wedge, hairlines, registration marks |
+| `test/marginruler.ps` | numbered bars for reading the unprintable margins off a print |
+
+`make lint` syntax-checks the scripts and validates the PPD with `cupstestppd`.
+
+## Device facts
+
+From `@PJL INFO CONFIG` / `INFO VARIABLES` and the printer's Configuration Report:
+
+| | |
+|---|---|
+| Model, serial | CLP-620 Series, `Z32DBAHB700266N` |
+| Firmware | V2.20.01.51 (2011-05-20), engine 1.02.27 |
+| Languages | PCL5Ce v5.94.03, PCL6 v6.44, SPL-C v5.43 |
+| Personalities | `PCL`, `PCLXL`, `QPDL`, `COLOR`, … |
+| Resolutions | 200, 300, 600, FAST1200, 1200 dpi |
+| Memory | 256 MB |
+| Duplex unit | installed |
+| Trays | `INTRAY1`, `MPTRAY`; `MEDIASOURCE` = AUTO/TRAY1/MPF/TRAY2/TRAY3/MANUAL/TRAY4 |
+| Paper sizes | 17, including A4/Letter/Legal/Folio/Oficio and 5 envelopes |
+
+Two findings worth recording.
+
+**There is no `RENDERMODE` PJL variable on this model.** Ghostscript emits
+`@PJL SET RENDERMODE=COLOR` and the firmware ignores it. Colour comes from the
+page language alone.
+
+**PostScript is not implemented**, despite `POSTSCRIPT` and `PS3` appearing in
+the `PERSONALITY` enum. The Configuration Report lists only PCL5Ce, PCL6 and
+SPL-C, so a PostScript PPD would have been a dead end.
+
+## Banding, and why it is required
+
+The engine refuses any single raster block taller than somewhere between 4000
+and 6000 rows. It discards the whole page silently: no error, no output, and
+`@PJL USTATUS JOB` reports `PAGES=0`. Full-page A4 at 600 dpi is 6816 rows,
+over that ceiling.
+
+Compression has nothing to do with it. A 62 KB page failed exactly as a 12 MB
+one did, at identical geometry. Measured directly at 600 dpi:
+
+| raster | result |
+|---|---|
+| 4758x6817, one block | discarded |
+| 4758x6000, one block | discarded |
+| 4758x4000, one block | prints |
+| 4758x6816, five blocks of 1704 | prints, full page |
+
+So the filter emits each page as several raster blocks of `BAND_ROWS` rows,
+positioning each with the PCL cursor. That lifts the ceiling entirely and full
+600 dpi colour works.
+
+### Host halftoning was tried and abandoned
+
+An earlier version halftoned to 1-bit CMY with Floyd-Steinberg, on the theory
+that 3 bits per pixel would fit where 24 would not. The device accepts CID
+`{1,3,0,1,1,1}` and then ignores the declared depth, consuming each row as
+8-bit pixels, so the image printed at one eighth of its intended width.
+
+Sending continuous tone and letting the engine halftone is both correct and
+better looking, so that path was removed. `tools/pcl5c-decode.py` decodes
+filter output back to PNG, which is how the 1-bit misbehaviour was identified
+without wasting paper.
+
+## Margins
+
+The unprintable margins are not symmetric and are considerably larger than the
+4.23 mm a generic PPD assumes, especially at the bottom:
+
+| edge | unprintable |
+|---|---|
+| top | 6 mm |
+| left | 6 mm |
+| right | 9 mm |
+| bottom | 12 mm |
+
+That leaves about 195 x 279 mm of A4 actually printable. Assuming 4.23 mm all
+round makes the raster 201.5 x 288.6 mm, so the right edge and the bottom of
+every page are silently clipped.
+
+`test/marginruler.ps` measures this without a ruler or a photograph. It prints
+numbered bars at 0, 3, 6 ... 30 mm in from each edge; bars in the unprintable
+region never appear, so the lowest visible number on each edge is the margin.
+Reprint it after any change to `ImageableArea`.
+
+## The phantom paper jam
+
+If the queue reports `media-jam-warning` with no jam anywhere, the cause is an
+**empty MP/bypass tray**.
+
+This model raises a real `inputMediaSupplyEmpty` alert (`prtAlertCode 808`) for
+the bypass tray, but reports it in `hrPrinterDetectedErrorState` using bit 5,
+`jammed`, instead of bit 1, `noPaper`. The `socket` backend polls that byte over
+SNMP and relays exactly what it is told, so the queue shows a jam.
+
+```
+hrPrinterDetectedErrorState = 0400     <- bit 5, "jammed"
+MP Tray  level=0  status=8             <- empty, critical
+alert: "The paper supply in the Bypass Tray is empty."
+```
+
+Put paper in the bypass tray and the byte returns to `0000`. Run
+`./scripts/check-state.sh` to see the decoded bits, tray levels, supply
+percentages and pending alerts.
+
+Do not reach for `lpadmin -o cupsSNMPSupplies=false`. It silences the false jam
+but disables the same SNMP query that reports toner levels, so you lose both.
+
+## Limitations
+
+- No ICC colour management. Output is Apple's RGB rasterisation sent straight
+  to the printer's own colour engine, not a profiled match.
+- Greyscale is sent as 24-bit RGB rather than a single channel, which wastes
+  bandwidth the compression mostly hides.
+- `BAND_ROWS` is 1704, chosen well below the measured ceiling rather than
+  tuned. Larger bands would cut per-block overhead slightly.

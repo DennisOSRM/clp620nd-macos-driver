@@ -1,0 +1,60 @@
+%!PS-Adobe-3.0
+%%Title: CLP-620ND margin ruler
+%%BoundingBox: 0 0 595 842
+%%EndComments
+% Bars at known distances from each page edge. Whichever is the lowest-numbered
+% bar that actually prints marks where the printable area begins on that edge,
+% so the unprintable margin can be read off without measuring anything.
+/mm { 72 mul 25.4 div } def
+/L { /Helvetica-Bold findfont 7.5 scalefont setfont } def
+/PW 210 def /PH 297 def
+
+/bar {              % n edge -> draw bar n mm in from that edge
+  /edge exch def /n exch def
+  0 setgray
+  edge 0 eq {       % top
+    n mm PW 2 div 40 mm sub exch  % x y
+    newpath 60 mm 3 sub 0 rmoveto } if
+} def
+
+% --- top edge: horizontal bars, n mm below the top ---
+0 3 30 {
+  /n exch def
+  0 setgray
+  newpath  20 mm  PH n sub mm  moveto  12 mm 0 rlineto  0 1.2 mm rlineto
+           -12 mm 0 rlineto closepath fill
+  L 33 mm PH n sub mm 0.2 mm add moveto n 3 string cvs show
+} for
+% --- bottom edge: horizontal bars, n mm above the bottom ---
+0 3 30 {
+  /n exch def
+  0 setgray
+  newpath  20 mm  n mm  moveto  12 mm 0 rlineto  0 1.2 mm rlineto
+           -12 mm 0 rlineto closepath fill
+  L 33 mm n mm 0.2 mm add moveto n 3 string cvs show
+} for
+% --- left edge: vertical bars, n mm right of the left edge ---
+0 3 30 {
+  /n exch def
+  0 setgray
+  newpath  n mm  120 mm  moveto  1.2 mm 0 rlineto  0 12 mm rlineto
+           -1.2 mm 0 rlineto closepath fill
+  L gsave n mm 0.2 mm add 134 mm translate 90 rotate 0 0 moveto n 3 string cvs show grestore
+} for
+% --- right edge: vertical bars, n mm left of the right edge ---
+0 3 30 {
+  /n exch def
+  0 setgray
+  newpath  PW n sub mm  180 mm  moveto  1.2 mm 0 rlineto  0 12 mm rlineto
+           -1.2 mm 0 rlineto closepath fill
+  L gsave PW n sub mm 0.2 mm add 194 mm translate 90 rotate 0 0 moveto n 3 string cvs show grestore
+} for
+
+0 setgray /Helvetica-Bold findfont 13 scalefont setfont
+60 mm 210 mm moveto (CLP-620ND margin ruler) show
+/Helvetica findfont 8 scalefont setfont
+60 mm 203 mm moveto (Each bar is labelled with its distance in mm from the nearest paper edge.) show
+60 mm 198 mm moveto (Report the LOWEST number still visible on each of the four edges.) show
+60 mm 193 mm moveto (Top and bottom bars sit near the left; left and right bars sit mid-page.) show
+showpage
+%%EOF

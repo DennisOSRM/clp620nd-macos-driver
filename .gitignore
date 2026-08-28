@@ -1,0 +1,8 @@
+# Build artefacts - regenerate with `make`
+filter/rastertoclp620
+ppd/*.ppd
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+.DS_Store
