@@ -74,8 +74,11 @@ points at that absolute path. That directory is one the print sandbox allows.
 | `tools/pcl5c-decode.py` | decode filter output back to PNG, to check pages without printing |
 | `test/testpage.pdf` | CMYK ramps, RGB swatches, grey wedge, hairlines, registration marks |
 | `test/marginruler.ps` | numbered bars for reading the unprintable margins off a print |
+| `test/run_tests.py` | filter tests: colour conversion, banding, PJL setup, failure paths |
+| `test/mkraster.c`, `decode.py` | synthetic CUPS rasters in, decoded pixels out |
 
-`make lint` syntax-checks the scripts and validates the PPD with `cupstestppd`.
+`make check` runs the offline test suites — no printer needed. `make lint`
+syntax-checks the scripts and validates the PPD with `cupstestppd`.
 
 ## Device facts
 

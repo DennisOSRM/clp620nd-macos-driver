@@ -1,6 +1,9 @@
 # Build artefacts - regenerate with `make`
 filter/rastertoclp620
+backend/clp620
 ppd/*.ppd
+test/tmp/
+__pycache__/
 
 # Local Claude Code settings
 .claude/settings.local.json

@@ -16,16 +16,17 @@
  * blocks of BAND_ROWS each, positioned with the PCL cursor.  Compression is
  * irrelevant to the ceiling; a 62 KB page failed just as a 12 MB one did.
  *
- * Contone RGB throughout.  Host halftoning to 1-bit CMY was tried and
- * abandoned: the device accepts CID {1,3,0,1,1,1} and then ignores the depth,
- * consuming the row as 8-bit pixels, so the image prints at one eighth width.
- * Sending continuous tone and letting the engine halftone is both correct and
- * better looking.
+ * Contone RGB throughout, at 300 and at 600 dpi.  Host halftoning to 1-bit CMY
+ * was tried and abandoned: the device accepts CID {1,3,0,1,1,1} and then
+ * ignores the depth, consuming the row as 8-bit pixels, so the image prints at
+ * one eighth width.  Sending continuous tone and letting the engine halftone is
+ * both correct and better looking.
  *
  * Page geometry, duplex, tray, media and copies are set with PJL, using the
  * enum spellings the firmware reports via INFO CONFIG / INFO VARIABLES.
  */
 
+#include <cups/cups.h>
 #include <cups/raster.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,48 +37,80 @@
 
 #define BAND_ROWS 1704      /* comfortably under the observed row ceiling */
 
-static int Canceled = 0;
+static volatile sig_atomic_t Canceled = 0;
 static void cancel_job(int sig) { (void)sig; Canceled = 1; }
 
-/* PPD PageSize keyword -> PJL PAPER name (from @PJL INFO CONFIG PAPERS). */
-static const char *pjl_paper(const char *ps)
+/*
+ * PPD PageSize keyword -> PJL PAPER name (from @PJL INFO CONFIG PAPERS), with
+ * the media dimensions in points so a missing PageSize option can be recovered
+ * from the raster header instead of being guessed.  Keep in step with the
+ * PAGESIZES list in tools/genppd.sh.
+ */
+static const struct paper {
+    const char *ppd, *pjl;
+    int w, h;
+} Papers[] = {
+    { "A4",                 "A4",         595,  842 },
+    { "Letter",             "LETTER",     612,  792 },
+    { "Legal",              "LEGAL",      612, 1008 },
+    { "Executive",          "EXECUTIVE",  522,  756 },
+    { "B5",                 "JISB5",      516,  729 },
+    { "ISOB5",              "ISOB5",      499,  709 },
+    { "A5",                 "A5",         420,  595 },
+    { "A6",                 "A6",         298,  420 },
+    { "FanFoldGermanLegal", "FOLIO",      612,  936 },
+    { "8.5x13.5",           "OFICIO",     612,  972 },
+    { "Statement",          "STATEMENT",  396,  612 },
+    { "Env10",              "NO10ENV",    297,  684 },
+    { "EnvMonarch",         "MONARCHENV", 279,  540 },
+    { "EnvDL",              "DLENV",      312,  624 },
+    { "EnvC5",              "C5ENV",      459,  649 },
+    { "EnvC6",              "C6ENV",      323,  459 },
+};
+#define NPAPERS (sizeof Papers / sizeof Papers[0])
+
+static const char *pjl_paper_by_name(const char *ps)
 {
-    if (!ps || !*ps)                           return "A4";
-    if (!strcasecmp(ps, "Letter"))             return "LETTER";
-    if (!strcasecmp(ps, "Legal"))              return "LEGAL";
-    if (!strcasecmp(ps, "Executive"))          return "EXECUTIVE";
-    if (!strcasecmp(ps, "B5"))                 return "JISB5";
-    if (!strcasecmp(ps, "ISOB5"))              return "ISOB5";
-    if (!strcasecmp(ps, "A5"))                 return "A5";
-    if (!strcasecmp(ps, "A6"))                 return "A6";
-    if (!strcasecmp(ps, "FanFoldGermanLegal")) return "FOLIO";
-    if (!strcasecmp(ps, "8.5x13.5"))           return "OFICIO";
-    if (!strcasecmp(ps, "Statement"))          return "STATEMENT";
-    if (!strcasecmp(ps, "Env10"))              return "NO10ENV";
-    if (!strcasecmp(ps, "EnvMonarch"))         return "MONARCHENV";
-    if (!strcasecmp(ps, "EnvDL"))              return "DLENV";
-    if (!strcasecmp(ps, "EnvC5"))              return "C5ENV";
-    if (!strcasecmp(ps, "EnvC6"))              return "C6ENV";
-    return "A4";
+    if (!ps || !*ps) return NULL;
+    for (size_t i = 0; i < NPAPERS; i++)
+        if (!strcasecmp(ps, Papers[i].ppd)) return Papers[i].pjl;
+    return NULL;
 }
 
-/* Look up one "Key=Value" out of the CUPS options string; last wins. */
-static void get_opt(const char *opts, const char *key, char *buf, size_t len, const char *def)
+/*
+ * Recover the paper name from the page dimensions the rasteriser recorded.
+ * Both orientations are accepted; 4 points of slack covers the rounding
+ * between the PPD's integer points and the header's float.
+ */
+static const char *pjl_paper_by_size(double w, double h)
 {
-    const char *p = opts;
-    size_t klen = strlen(key);
-    buf[0] = '\0';
-    while (p && *p) {
-        while (*p == ' ') p++;
-        if (!strncasecmp(p, key, klen) && p[klen] == '=') {
-            const char *v = p + klen + 1, *e = strchr(v, ' ');
-            size_t n = e ? (size_t)(e - v) : strlen(v);
-            if (n >= len) n = len - 1;
-            memcpy(buf, v, n); buf[n] = '\0';
-        }
-        p = strchr(p, ' ');
+    if (w <= 0 || h <= 0) return NULL;
+    for (size_t i = 0; i < NPAPERS; i++) {
+        double pw = Papers[i].w, ph = Papers[i].h;
+        int upright  = (w > pw - 4 && w < pw + 4) && (h > ph - 4 && h < ph + 4);
+        int rotated  = (w > ph - 4 && w < ph + 4) && (h > pw - 4 && h < pw + 4);
+        if (upright || rotated) return Papers[i].pjl;
     }
-    if (!buf[0]) { strncpy(buf, def, len - 1); buf[len - 1] = '\0'; }
+    return NULL;
+}
+
+/*
+ * Media types the firmware reports.  The value goes straight into a PJL
+ * command, so it is whitelisted rather than passed through: an unknown or
+ * hostile option string must not be able to inject PJL of its own.
+ */
+static const char *MediaTypes[] = {
+    "PLAIN", "THICK", "THIN", "BOND", "COLORED", "CARDSTOCK",
+    "LABEL", "OHP", "ENVELOPE", "RECYCLED", "LETTERHEAD", "PREPRINTED",
+};
+
+static const char *pjl_mediatype(const char *m)
+{
+    if (!m || !*m) return "PLAIN";
+    for (size_t i = 0; i < sizeof MediaTypes / sizeof MediaTypes[0]; i++)
+        if (!strcasecmp(m, MediaTypes[i])) return MediaTypes[i];
+    fprintf(stderr, "WARNING: rastertoclp620: unknown MediaType \"%s\", using PLAIN\n", m);
+    return "PLAIN";
 }
 
 /*
@@ -138,6 +171,64 @@ static size_t deltarow(const unsigned char *cur, const unsigned char *prev,
     return o;
 }
 
+/*
+ * Source bytes per pixel for the colour spaces this filter converts.  Anything
+ * not listed here is rejected in check_header() rather than silently turned
+ * into a blank page.
+ */
+static unsigned bytes_per_pixel(cups_cspace_t cs)
+{
+    switch (cs) {
+        case CUPS_CSPACE_K:
+        case CUPS_CSPACE_W:
+        case CUPS_CSPACE_SW:    return 1;
+        case CUPS_CSPACE_RGB:
+        case CUPS_CSPACE_SRGB:  return 3;
+        case CUPS_CSPACE_RGBA:
+        case CUPS_CSPACE_CMYK:  return 4;
+        default:                return 0;
+    }
+}
+
+/* Reject any raster this filter would otherwise misread.  0 = unusable. */
+static int check_header(const cups_page_header2_t *h, int page)
+{
+    unsigned bpp = bytes_per_pixel(h->cupsColorSpace);
+
+    if (!h->cupsWidth || !h->cupsHeight) {
+        fprintf(stderr, "ERROR: rastertoclp620: page %d has zero extent (%ux%u)\n",
+                page, h->cupsWidth, h->cupsHeight);
+        return 0;
+    }
+    if (h->cupsBitsPerColor != 8) {
+        fprintf(stderr, "ERROR: rastertoclp620: page %d is %u bits per colour, "
+                "only 8 is supported\n", page, h->cupsBitsPerColor);
+        return 0;
+    }
+    if (h->cupsColorOrder != CUPS_ORDER_CHUNKED) {
+        fprintf(stderr, "ERROR: rastertoclp620: page %d uses colour order %u, "
+                "only chunked (%d) is supported\n",
+                page, h->cupsColorOrder, CUPS_ORDER_CHUNKED);
+        return 0;
+    }
+    if (!bpp) {
+        fprintf(stderr, "ERROR: rastertoclp620: page %d uses unsupported colour "
+                "space %u\n", page, h->cupsColorSpace);
+        return 0;
+    }
+    if (h->cupsBytesPerLine < (size_t)h->cupsWidth * bpp) {
+        fprintf(stderr, "ERROR: rastertoclp620: page %d claims %u bytes per line, "
+                "too short for %u pixels at %u bytes each\n",
+                page, h->cupsBytesPerLine, h->cupsWidth, bpp);
+        return 0;
+    }
+    if (!h->HWResolution[0]) {
+        fprintf(stderr, "ERROR: rastertoclp620: page %d has no resolution\n", page);
+        return 0;
+    }
+    return 1;
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 6 || argc > 7) {
@@ -151,16 +242,28 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    const char *title = argv[3], *opts = argv[5];
+    const char *title = argv[3] && *argv[3] ? argv[3] : "CUPS";
     int copies = atoi(argv[4]); if (copies < 1) copies = 1;
 
-    char pagesize[64], colormodel[32], duplex[32], slot[32], media[32], tsave[16];
-    get_opt(opts, "PageSize",   pagesize,   sizeof pagesize,   "A4");
-    get_opt(opts, "ColorModel", colormodel, sizeof colormodel, "RGB");
-    get_opt(opts, "Duplex",     duplex,     sizeof duplex,     "None");
-    get_opt(opts, "InputSlot",  slot,       sizeof slot,       "Auto");
-    get_opt(opts, "MediaType",  media,      sizeof media,      "PLAIN");
-    get_opt(opts, "TonerSave",  tsave,      sizeof tsave,      "False");
+    /*
+     * Options come from cupsd as one "key=value key=value" string; let libcups
+     * parse it so quoting and escapes behave the way the rest of CUPS expects.
+     * ColorModel is deliberately not read: the authoritative colour space is
+     * the one in the raster header, which is what actually describes the bytes.
+     */
+    cups_option_t *options = NULL;
+    int num_options = cupsParseOptions(argv[5], 0, &options);
+    const char *o_pagesize = cupsGetOption("PageSize",  num_options, options);
+    const char *o_duplex   = cupsGetOption("Duplex",    num_options, options);
+    const char *o_slot     = cupsGetOption("InputSlot", num_options, options);
+    const char *o_media    = cupsGetOption("MediaType", num_options, options);
+    const char *o_tsave    = cupsGetOption("TonerSave", num_options, options);
+
+    const char *media  = pjl_mediatype(o_media);
+    const char *duplex = o_duplex ? o_duplex : "None";
+    const char *slot   = o_slot   ? o_slot   : "Auto";
+    int tonersave = o_tsave && (!strcasecmp(o_tsave, "True") ||
+                                !strcasecmp(o_tsave, "On"));
 
     struct sigaction action;
     memset(&action, 0, sizeof action);
@@ -169,26 +272,55 @@ int main(int argc, char *argv[])
     sigaction(SIGTERM, &action, NULL);
 
     cups_raster_t *ras = cupsRasterOpen(fd, CUPS_RASTER_READ);
-    if (!ras) { fputs("ERROR: rastertoclp620: cannot read raster stream\n", stderr); return 1; }
+    if (!ras) {
+        fputs("ERROR: rastertoclp620: cannot read raster stream\n", stderr);
+        cupsFreeOptions(num_options, options);
+        if (fd) close(fd);
+        return 1;
+    }
 
     cups_page_header2_t h;
-    int page = 0;
+    int page = 0, failed = 0, started = 0;
     unsigned char *line = NULL, *rgb = NULL, *comp = NULL, *prev = NULL, *dcomp = NULL;
-    size_t linecap = 0;
+    size_t linecap = 0, rgbcap = 0;
 
-    while (!Canceled && cupsRasterReadHeader2(ras, &h)) {
+    while (!Canceled && !failed && cupsRasterReadHeader2(ras, &h)) {
         page++;
-        fprintf(stderr, "PAGE: %d %d\n", page, 1);
+
+        if (!check_header(&h, page)) { failed = 1; break; }
 
         unsigned W = h.cupsWidth, H = h.cupsHeight, res = h.HWResolution[0];
         size_t rgbn = (size_t)W * 3;
-        fprintf(stderr, "DEBUG: rastertoclp620: page %d %ux%u @%udpi, %u band(s)\n",
-                page, W, H, res, (H + BAND_ROWS - 1) / BAND_ROWS);
+
+        fprintf(stderr, "PAGE: %d %d\n", page, 1);
+        fprintf(stderr, "DEBUG: rastertoclp620: page %d %ux%u @%udpi, cspace %u, "
+                "%u band(s)\n", page, W, H, res, h.cupsColorSpace,
+                (H + BAND_ROWS - 1) / BAND_ROWS);
 
         if (page == 1) {
-            printf("\033%%-12345X@PJL JOB NAME=\"%.60s\"\r\n", title ? title : "CUPS");
+            /*
+             * Prefer the PageSize option, fall back to the dimensions the
+             * rasteriser recorded, and only then to A4.  Blindly assuming A4
+             * would silently mis-size every job that arrives without the
+             * option set.
+             */
+            const char *paper = pjl_paper_by_name(o_pagesize);
+            if (!paper)
+                paper = pjl_paper_by_size(h.cupsPageSize[0], h.cupsPageSize[1]);
+            if (!paper)
+                paper = pjl_paper_by_size(h.PageSize[0], h.PageSize[1]);
+            if (!paper) {
+                fprintf(stderr, "WARNING: rastertoclp620: cannot identify paper "
+                        "(PageSize=%s, %.0fx%.0f pt), using A4\n",
+                        o_pagesize ? o_pagesize : "unset",
+                        h.cupsPageSize[0], h.cupsPageSize[1]);
+                paper = "A4";
+            }
+
+            started = 1;
+            printf("\033%%-12345X@PJL JOB NAME=\"%.60s\"\r\n", title);
             printf("@PJL SET RESOLUTION=%u\r\n", res);
-            printf("@PJL SET PAPER=%s\r\n", pjl_paper(pagesize));
+            printf("@PJL SET PAPER=%s\r\n", paper);
             if (copies > 1) printf("@PJL SET COPIES=%d\r\n", copies);
             if (!strcasecmp(duplex, "DuplexNoTumble"))
                 printf("@PJL SET DUPLEX=ON\r\n@PJL SET BINDING=LONGEDGE\r\n");
@@ -201,8 +333,7 @@ int main(int argc, char *argv[])
             else if (!strcasecmp(slot, "Manual")) printf("@PJL SET MEDIASOURCE=MANUAL\r\n@PJL SET MANUALFEED=ON\r\n");
             else                                  printf("@PJL SET MEDIASOURCE=AUTO\r\n");
             printf("@PJL SET MEDIATYPE=%s\r\n", media);
-            printf("@PJL SET TONERSAVE=%s\r\n",
-                   (!strcasecmp(tsave, "True") || !strcasecmp(tsave, "On")) ? "ON" : "OFF");
+            printf("@PJL SET TONERSAVE=%s\r\n", tonersave ? "ON" : "OFF");
             printf("@PJL ENTER LANGUAGE = PCL\r\n");
             fputs("\033E", stdout);
         }
@@ -214,22 +345,34 @@ int main(int argc, char *argv[])
         { unsigned char cid[6] = {0, 3, 0, 8, 8, 8};    /* devRGB, direct pixel, 8/8/8 */
           fwrite(cid, 1, 6, stdout); }
 
-        if (rgbn > linecap || !line) {
-            free(line); free(rgb); free(comp); free(prev); free(dcomp);
-            linecap = rgbn > h.cupsBytesPerLine ? rgbn : h.cupsBytesPerLine;
-            line  = malloc(linecap);
+        /*
+         * The input row and the derived RGB row grow independently: a 4-byte
+         * per pixel space (RGBA, CMYK) needs a longer input buffer than the
+         * 3-byte RGB row it produces, so both caps are tracked separately.
+         */
+        if (h.cupsBytesPerLine > linecap) {
+            free(line);
+            linecap = h.cupsBytesPerLine;
+            line = malloc(linecap);
+        }
+        if (rgbn > rgbcap) {
+            free(rgb); free(comp); free(prev); free(dcomp);
+            rgbcap = rgbn;
             rgb   = malloc(rgbn);
             comp  = malloc(rgbn + rgbn / 128 + 16);
             prev  = malloc(rgbn);
             dcomp = malloc(2 * rgbn + rgbn / 255 + 16);
-            if (!line || !rgb || !comp || !prev || !dcomp) {
-                fputs("ERROR: rastertoclp620: out of memory\n", stderr);
-                cupsRasterClose(ras); return 1;
-            }
+        }
+        if (!line || !rgb || !comp || !prev || !dcomp) {
+            fputs("ERROR: rastertoclp620: out of memory\n", stderr);
+            failed = 1;
+            break;
         }
 
         int curmode = -1;
-        for (unsigned y = 0; y < H && !Canceled; y++) {
+        for (unsigned y = 0; y < H; y++) {
+            if (Canceled) break;
+
             if (y % BAND_ROWS == 0) {
                 if (y) fputs("\033*rC", stdout);        /* close previous band */
                 unsigned rows = H - y < BAND_ROWS ? H - y : BAND_ROWS;
@@ -241,21 +384,50 @@ int main(int argc, char *argv[])
                 memset(prev, 0, rgbn);                  /* each block reseeds from zero */
             }
 
-            if (cupsRasterReadPixels(ras, line, h.cupsBytesPerLine) < 1) break;
+            /*
+             * A short read means the raster was truncated.  Half a page is not
+             * a successful job: bail out and let cupsd retry or report it,
+             * rather than ejecting a partial page and exiting 0.
+             */
+            unsigned got = cupsRasterReadPixels(ras, line, h.cupsBytesPerLine);
+            if (got != h.cupsBytesPerLine) {
+                fprintf(stderr, "ERROR: rastertoclp620: truncated raster on page "
+                        "%d row %u of %u (got %u of %u bytes)\n",
+                        page, y, H, got, h.cupsBytesPerLine);
+                failed = 1;
+                break;
+            }
 
             if (h.cupsColorSpace == CUPS_CSPACE_RGB ||
                 h.cupsColorSpace == CUPS_CSPACE_SRGB) {
                 memcpy(rgb, line, rgbn);
-            } else if (h.cupsColorSpace == CUPS_CSPACE_K ||
-                       h.cupsColorSpace == CUPS_CSPACE_W ||
-                       h.cupsColorSpace == CUPS_CSPACE_SW) {
-                int invert = (h.cupsColorSpace == CUPS_CSPACE_K);
+            } else if (h.cupsColorSpace == CUPS_CSPACE_RGBA) {
+                /* Straight alpha over an implied white page: drop the channel. */
                 for (unsigned x = 0; x < W; x++) {
-                    unsigned char v = line[x];
-                    if (invert) v = 255 - v;
+                    rgb[x*3]   = line[x*4];
+                    rgb[x*3+1] = line[x*4+1];
+                    rgb[x*3+2] = line[x*4+2];
+                }
+            } else if (h.cupsColorSpace == CUPS_CSPACE_K) {
+                /*
+                 * DeviceK is a colorant channel, not luminance: 0 means no
+                 * toner (white) and 255 means full black, so it inverts into
+                 * RGB.  Do not "fix" this to a pass-through - that is what
+                 * CUPS_CSPACE_W and CUPS_CSPACE_SW below are for, and getting
+                 * the two confused prints every greyscale page as a negative.
+                 */
+                for (unsigned x = 0; x < W; x++) {
+                    unsigned char v = (unsigned char)(255 - line[x]);
                     rgb[x*3] = rgb[x*3+1] = rgb[x*3+2] = v;
                 }
-            } else if (h.cupsColorSpace == CUPS_CSPACE_CMYK) {
+            } else if (h.cupsColorSpace == CUPS_CSPACE_W ||
+                       h.cupsColorSpace == CUPS_CSPACE_SW) {
+                /* Luminance: 0 is black, 255 is white, same sense as RGB. */
+                for (unsigned x = 0; x < W; x++) {
+                    unsigned char v = line[x];
+                    rgb[x*3] = rgb[x*3+1] = rgb[x*3+2] = v;
+                }
+            } else {    /* CUPS_CSPACE_CMYK; check_header() rejected the rest */
                 for (unsigned x = 0; x < W; x++) {
                     unsigned c = line[x*4], m = line[x*4+1],
                              yy = line[x*4+2], k = line[x*4+3];
@@ -263,8 +435,6 @@ int main(int argc, char *argv[])
                     rgb[x*3+1] = (unsigned char)((255 - m)  * (255 - k) / 255);
                     rgb[x*3+2] = (unsigned char)((255 - yy) * (255 - k) / 255);
                 }
-            } else {
-                memset(rgb, 255, rgbn);
             }
 
             size_t np = packbits(rgb, rgbn, comp);
@@ -281,22 +451,45 @@ int main(int argc, char *argv[])
             memcpy(prev, rgb, rgbn);
         }
 
+        if (failed || Canceled) break;
+
         fputs("\033*rC", stdout);                       /* close last band */
         fputs("\014", stdout);                          /* eject */
     }
 
-    if (page > 0) {
+    /*
+     * Three ways out.  A cancelled job resets the engine and leaves without a
+     * PJL EOJ, so the printer does not book the job as finished, and reports
+     * failure so cupsd does not treat it as a clean completion.  A truncated
+     * or malformed job does the same.  Only a run that emitted every page of
+     * every header closes the job normally.
+     */
+    if (Canceled) {
+        fputs("ERROR: rastertoclp620: job cancelled\n", stderr);
+        if (started) { fputs("\033*rC\033E", stdout); fputs("\033%-12345X", stdout); }
+        failed = 1;
+    } else if (failed) {
+        if (started) { fputs("\033*rC\033E", stdout); fputs("\033%-12345X", stdout); }
+    } else if (page > 0) {
         fputs("\033E", stdout);
         fputs("\033%-12345X", stdout);
-        printf("@PJL EOJ NAME=\"%.60s\"\r\n", title ? title : "CUPS");
+        printf("@PJL EOJ NAME=\"%.60s\"\r\n", title);
         fputs("\033%-12345X", stdout);
     } else {
         fputs("ERROR: rastertoclp620: no pages found\n", stderr);
+        failed = 1;
+    }
+
+    if (fflush(stdout) || ferror(stdout)) {
+        fputs("ERROR: rastertoclp620: cannot write to the printer\n", stderr);
+        failed = 1;
     }
 
     free(line); free(rgb); free(comp); free(prev); free(dcomp);
     cupsRasterClose(ras);
+    cupsFreeOptions(num_options, options);
     if (fd) close(fd);
-    fprintf(stderr, "DEBUG: rastertoclp620: %d page(s)\n", page);
-    return page ? 0 : 1;
+    fprintf(stderr, "DEBUG: rastertoclp620: %d page(s), %s\n",
+            page, failed ? "failed" : "ok");
+    return failed ? 1 : 0;
 }
