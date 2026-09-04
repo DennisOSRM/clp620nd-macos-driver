@@ -8,6 +8,7 @@ ARCHS      ?= -arch arm64 -arch x86_64
 all: filter/rastertoclp620 ppd
 
 filter/rastertoclp620: src/rastertoclp620.c
+	@mkdir -p filter
 	$(CC) $(CFLAGS) $(ARCHS) -o $@ $< -lcups
 
 ppd:            ## regenerate the PPD

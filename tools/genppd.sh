@@ -4,6 +4,8 @@
 set -euo pipefail
 FILTER_PATH="/Library/Printers/Samsung/CLP-620ND/filter/rastertoclp620"
 
+mkdir -p ppd
+
 # keyword/menu-label:width:height (points)
 PAGESIZES="
 A4/A4:595:842
