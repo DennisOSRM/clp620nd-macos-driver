@@ -62,7 +62,7 @@ cat <<HDR
 *Product: "(Samsung CLP-620 Series)"
 *ModelName: "Samsung CLP-620ND"
 *ShortNickName: "Samsung CLP-620ND"
-*NickName: "Samsung CLP-620ND, PCL6 Colour v1.0"
+*NickName: "Samsung CLP-620ND, PCL5c Colour v1.0"
 *PSVersion: "(3010.000) 0"
 *LanguageLevel: "3"
 *ColorDevice: True
@@ -107,12 +107,13 @@ cat <<'BODY'
 
 *OpenUI *Resolution/Resolution: PickOne
 *OrderDependency: 20 AnySetup *Resolution
-*% 300 dpi sends 24-bit contone RGB and lets the engine halftone.  600 dpi is
-*% halftoned on the host to 1-bit CMY, because a full-page 24-bit raster at
-*% 600 dpi needs about 97 MB of pixels, more than this engine can buffer.
+*% 300 and 600 dpi both send 24-bit contone RGB; the printer performs the
+*% final halftoning.  600 dpi works because the filter emits the page as
+*% several shorter raster blocks, staying under the engine's maximum
+*% single-raster-block height.
 *DefaultResolution: 600dpi
 *Resolution 300dpi/300 dpi (contone): "<</HWResolution[300 300]>>setpagedevice"
-*Resolution 600dpi/600 dpi (halftoned): "<</HWResolution[600 600]>>setpagedevice"
+*Resolution 600dpi/600 dpi (contone): "<</HWResolution[600 600]>>setpagedevice"
 *CloseUI: *Resolution
 
 *OpenUI *Duplex/2-Sided Printing: PickOne
@@ -157,10 +158,22 @@ cat <<'BODY'
 *CloseUI: *TonerSave
 
 *% Envelopes and transparencies cannot be duplexed; small media bypasses Tray 1.
+*% The envelope sizes are constrained by PageSize as well as by MediaType, so
+*% the restriction still applies when the media type is left at its default.
 *UIConstraints: *Duplex DuplexNoTumble *MediaType ENVELOPE
 *UIConstraints: *Duplex DuplexTumble  *MediaType ENVELOPE
 *UIConstraints: *Duplex DuplexNoTumble *MediaType OHP
 *UIConstraints: *Duplex DuplexTumble  *MediaType OHP
+*UIConstraints: *Duplex DuplexNoTumble *PageSize Env10
+*UIConstraints: *Duplex DuplexTumble  *PageSize Env10
+*UIConstraints: *Duplex DuplexNoTumble *PageSize EnvMonarch
+*UIConstraints: *Duplex DuplexTumble  *PageSize EnvMonarch
+*UIConstraints: *Duplex DuplexNoTumble *PageSize EnvDL
+*UIConstraints: *Duplex DuplexTumble  *PageSize EnvDL
+*UIConstraints: *Duplex DuplexNoTumble *PageSize EnvC5
+*UIConstraints: *Duplex DuplexTumble  *PageSize EnvC5
+*UIConstraints: *Duplex DuplexNoTumble *PageSize EnvC6
+*UIConstraints: *Duplex DuplexTumble  *PageSize EnvC6
 *UIConstraints: *InputSlot Tray1 *PageSize Env10
 *UIConstraints: *InputSlot Tray1 *PageSize EnvMonarch
 *UIConstraints: *InputSlot Tray1 *PageSize EnvDL
