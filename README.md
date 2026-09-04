@@ -21,8 +21,8 @@ hardware was never the limitation.
 ## How this driver works
 
 ```
-app ──▶ PDF ──▶ cgpdftoraster ──▶ CUPS raster ──▶ rastertoclp620 ──▶ PCL5c ──▶ socket://…:9100
-                (stock macOS)      RGB 8-bit       (this driver)
+app ──▶ PDF ──▶ cgpdftoraster ──▶ CUPS raster ──▶ rastertoclp620 ──▶ PCL5c ──▶ clp620://…:9100
+                (stock macOS)      RGB 8-bit       (this driver)                  (wraps socket)
 ```
 
 `cgpdftoraster` is Apple's own rasteriser and already produces 8-bit RGB when
@@ -59,11 +59,16 @@ macOS seals `/usr/libexec/cups/filter` under SIP, so the filter installs to
 `/Library/Printers/Samsung/CLP-620ND/filter/` and the PPD's `cupsFilter2` line
 points at that absolute path. That directory is one the print sandbox allows.
 
+`/usr/libexec/cups/backend` is *not* SIP-protected, so the `clp620` backend
+installs there alongside the stock ones. See [the phantom paper
+jam](#the-phantom-paper-jam) for what it is for.
+
 ## Layout
 
 | path | purpose |
 |---|---|
 | `src/rastertoclp620.c` | the filter: CUPS raster to PCL5c |
+| `src/clp620-backend.c` | the backend: `socket` plus the phantom-jam fix |
 | `tools/genppd.sh` | generates the PPD — edit this, not the PPD |
 | `tools/pclxl-dis.py` | PCL-XL disassembler, kept from the PCL6 investigation |
 | `ppd/Samsung-CLP-620ND.ppd` | 16 paper sizes, colour, duplex, trays, media types |
@@ -76,7 +81,9 @@ points at that absolute path. That directory is one the print sandbox allows.
 | `test/testpage.pdf` | CMYK ramps, RGB swatches, grey wedge, hairlines, registration marks |
 | `test/marginruler.ps` | numbered bars for reading the unprintable margins off a print |
 | `test/run_tests.py` | filter tests: colour conversion, banding, PJL setup, failure paths |
+| `test/test_backend.py` | backend tests: jam filtering, fail-safe, exit-status propagation |
 | `test/mkraster.c`, `decode.py` | synthetic CUPS rasters in, decoded pixels out |
+| `test/fakeagent.py`, `stub_socket.sh` | stand-ins for the printer's SNMP agent and the socket backend |
 
 `make check` runs the offline test suites — no printer needed. `make lint`
 syntax-checks the scripts and validates the PPD with `cupstestppd`.
@@ -163,13 +170,21 @@ Reprint it after any change to `ImageableArea`.
 
 ## The phantom paper jam
 
-If the queue reports `media-jam-warning` with no jam anywhere, the cause is an
-**empty MP/bypass tray**.
+A queue reporting `media-jam-warning` with no jam anywhere is an **empty
+MP/bypass tray**. The `clp620` backend fixes this; the mechanism is below.
 
-This model raises a real `inputMediaSupplyEmpty` alert (`prtAlertCode 808`) for
-the bypass tray, but reports it in `hrPrinterDetectedErrorState` using bit 5,
-`jammed`, instead of bit 1, `noPaper`. The `socket` backend polls that byte over
-SNMP and relays exactly what it is told, so the queue shows a jam.
+The firmware raises a correct `inputMediaSupplyEmpty` alert (`prtAlertCode 808`)
+for the bypass tray, then reports it in `hrPrinterDetectedErrorState` as bit 5,
+`jammed`. The encodings say what went wrong:
+
+```
+inputTrayEmpty   bit 13   ->   00 04      <- what it means
+jammed           bit  5   ->   04 00      <- what it sends
+```
+
+The right bit value, written into the wrong octet. The device contradicts itself
+at the same instant — `prtAlertTable` says 808 and lists no jam, while the
+Host-Resources bitmap says jam — so only the bitmap is wrong.
 
 ```
 hrPrinterDetectedErrorState = 0400     <- bit 5, "jammed"
@@ -177,12 +192,30 @@ MP Tray  level=0  status=8             <- empty, critical
 alert: "The paper supply in the Bypass Tray is empty."
 ```
 
-Put paper in the bypass tray and the byte returns to `0000`. Run
-`./scripts/check-state.sh` to see the decoded bits, tray levels, supply
-percentages and pending alerts.
+`socket` relays that byte faithfully and CUPS maps bit 5 to
+`media-jam-warning`. Because an empty bypass tray is this printer's normal
+resting state, the false jam is permanent.
+
+**The fix.** `src/clp620-backend.c` is a CUPS backend that execs the stock
+`socket` backend, passes everything through, and drops `media-jam-warning` from
+its `STATE:` lines only when `prtAlertTable` confirms no jam. A real jam still
+reports — detection accepts either IANA `prtAlertCode` 8 or the word "jam" in
+`prtAlertDescription`. If SNMP does not answer it fails safe and passes the jam
+through unfiltered, on the grounds that a phantom jam is an annoyance and a
+concealed real one is not.
+
+It speaks SNMPv1 directly over UDP rather than linking net-snmp, whose ABI moves
+between macOS releases and which wants MIB files the backend sandbox need not
+grant. The backend links nothing but libSystem.
+
+`install.sh` uses `clp620://ip:9100` by default and falls back to plain
+`socket://` with a warning if `/usr/libexec/cups/backend` is ever locked down.
+Pass `socket://ip:9100` as the third argument to bypass the filtering.
 
 Do not reach for `lpadmin -o cupsSNMPSupplies=false`. It silences the false jam
-but disables the same SNMP query that reports toner levels, so you lose both.
+but disables the same SNMP query that reports toner levels, so you lose both —
+which is the whole reason the backend exists. Run `./scripts/check-state.sh` to
+see the decoded bits, tray levels, supply percentages and pending alerts.
 
 ## Limitations
 

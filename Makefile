@@ -5,11 +5,15 @@ ARCHS      ?= -arch arm64 -arch x86_64
 
 .PHONY: all clean install uninstall test check probe fsdump lint ppd
 
-all: filter/rastertoclp620 ppd
+all: filter/rastertoclp620 backend/clp620 ppd
 
 filter/rastertoclp620: src/rastertoclp620.c
 	@mkdir -p filter
 	$(CC) $(CFLAGS) $(ARCHS) -o $@ $< -lcups
+
+backend/clp620: src/clp620-backend.c
+	@mkdir -p backend
+	$(CC) $(CFLAGS) $(ARCHS) -o $@ $<
 
 ppd:            ## regenerate the PPD
 	./tools/genppd.sh
@@ -18,9 +22,10 @@ check: all      ## run the offline filter test suite (no printer needed)
 	@mkdir -p test/tmp
 	$(CC) $(CFLAGS) -o test/tmp/mkraster test/mkraster.c -lcups
 	@python3 test/run_tests.py
+	@python3 test/test_backend.py
 
 lint: all       ## syntax-check scripts and validate the PPD
-	@for f in scripts/*.sh tools/*.sh; do bash -n $$f && echo "$$f OK"; done
+	@for f in scripts/*.sh tools/*.sh test/*.sh; do bash -n $$f && echo "$$f OK"; done
 	@for f in tools/*.py test/*.py; do python3 -m py_compile $$f && echo "$$f OK"; done
 	@cupstestppd ppd/Samsung-CLP-620ND.ppd
 
@@ -40,5 +45,5 @@ fsdump:         ## walk the printer's PJL filesystem (read-only)
 	./tools/pjl-fsdump.py $(PRINTER_IP)
 
 clean:
-	rm -f filter/rastertoclp620 ppd/Samsung-CLP-620ND.ppd
+	rm -f filter/rastertoclp620 backend/clp620 ppd/Samsung-CLP-620ND.ppd
 	rm -rf test/tmp

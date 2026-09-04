@@ -7,4 +7,5 @@ QUEUE="${1:-CLP620ND}"
 lpadmin -x "$QUEUE" 2>/dev/null && echo "removed queue $QUEUE" || echo "no queue $QUEUE"
 rm -rf /Library/Printers/Samsung/CLP-620ND
 rm -f  /Library/Printers/PPDs/Contents/Resources/Samsung-CLP-620ND.ppd
+rm -f  /usr/libexec/cups/backend/clp620
 echo "driver files removed"
