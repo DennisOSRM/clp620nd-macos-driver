@@ -3,7 +3,7 @@ QUEUE      ?= CLP620ND
 CFLAGS     ?= -O2 -Wall -Wextra
 ARCHS      ?= -arch arm64 -arch x86_64
 
-.PHONY: all clean install uninstall test check probe lint ppd
+.PHONY: all clean install uninstall test check probe fsdump lint ppd
 
 all: filter/rastertoclp620 ppd
 
@@ -35,6 +35,9 @@ test:           ## print the colour test page
 
 probe:          ## dump printer config over PJL
 	./scripts/probe.sh $(PRINTER_IP) "INFO CONFIG"
+
+fsdump:         ## walk the printer's PJL filesystem (read-only)
+	./tools/pjl-fsdump.py $(PRINTER_IP)
 
 clean:
 	rm -f filter/rastertoclp620 ppd/Samsung-CLP-620ND.ppd

@@ -72,6 +72,7 @@ points at that absolute path. That directory is one the print sandbox allows.
 | `scripts/testprint.sh` | print the colour test page |
 | `scripts/check-state.sh` | decode SNMP error bits, tray levels and supply percentages |
 | `tools/pcl5c-decode.py` | decode filter output back to PNG, to check pages without printing |
+| `tools/pjl-fsdump.py` | walk the printer's PJL filesystem, read-only (`make fsdump`) |
 | `test/testpage.pdf` | CMYK ramps, RGB swatches, grey wedge, hairlines, registration marks |
 | `test/marginruler.ps` | numbered bars for reading the unprintable margins off a print |
 | `test/run_tests.py` | filter tests: colour conversion, banding, PJL setup, failure paths |
