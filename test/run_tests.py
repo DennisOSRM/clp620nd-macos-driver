@@ -224,6 +224,52 @@ check("copies 7", "@PJL SET COPIES=7" in L, str(L))
 rc, L = pjl("", copies="0")
 check("copies 0 -> no COPIES line", not any("COPIES" in l for l in L), str(L))
 
+print("\n== adaptive compression (mode 5) ==")
+
+def adaptive_methods(data):
+    """Sub-block methods used by every ESC*b#W that follows an ESC*b5M."""
+    used = set(); mode = 0; i = 0; n = len(data)
+    while i < n:
+        m = re.match(rb'\x1b\*b(\d+)([WM])', data[i:])
+        if not m:
+            i += 1; continue
+        val = int(m.group(1)); kind = m.group(2); i += m.end()
+        if kind == b'M':
+            mode = val; continue
+        chunk = data[i:i+val]; i += val
+        if mode != 5:
+            continue
+        j = 0
+        while j + 3 <= len(chunk):
+            meth = chunk[j]; cnt = (chunk[j+1] << 8) | chunk[j+2]
+            used.add(meth); j += 3
+            if meth not in (4, 5):
+                j += cnt
+    return used
+
+for pat in ("ramp", "rgbtest", "fill:255", "fill:0"):
+    f = os.path.join(S, "adapt.ras")
+    # 4000 rows spans several BAND_ROWS blocks, so runs meet band boundaries
+    mkras(f, RGB, 8, 0, 400, 4000, 600, 1, pat)
+    rc0, out0, _ = run(f)
+    rc1, out1, _ = run(f, "AdaptiveCompression=True")
+    _, _, p0 = parse(out0)
+    _, _, p1 = parse(out1)
+    check("adaptive %s: both succeed" % pat, rc0 == 0 and rc1 == 0)
+    check("adaptive %s: one page each" % pat, len(p0) == 1 and len(p1) == 1)
+    if len(p0) == 1 and len(p1) == 1:
+        check("adaptive %s: pixel-identical to per-row modes" % pat,
+              p0[0] == p1[0],
+              "%d vs %d rows" % (len(p0[0]), len(p1[0])))
+    check("adaptive %s: selects mode 5" % pat, b'\x1b*b5M' in out1)
+    # Method 4 fills with zero bytes, which is black in direct RGB, never white.
+    check("adaptive %s: never emits method 4" % pat,
+          4 not in adaptive_methods(out1), str(sorted(adaptive_methods(out1))))
+    check("adaptive %s: off by default" % pat, b'\x1b*b5M' not in out0)
+    if pat != "rgbtest":        # rgbtest has no repeating rows to collapse
+        check("adaptive %s: smaller than per-row" % pat, len(out1) < len(out0),
+              "%d vs %d" % (len(out1), len(out0)))
+
 print("\n== paper size ==")
 for ps, want in [("A4","A4"), ("Letter","LETTER"), ("Legal","LEGAL"),
                  ("Env10","NO10ENV"), ("EnvDL","DLENV"), ("A6","A6"),
