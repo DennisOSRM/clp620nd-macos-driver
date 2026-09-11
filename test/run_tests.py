@@ -178,7 +178,7 @@ rc, L = pjl("")
 check("defaults: DUPLEX=OFF", "@PJL SET DUPLEX=OFF" in L, str(L))
 check("defaults: MEDIASOURCE=AUTO", "@PJL SET MEDIASOURCE=AUTO" in L)
 check("defaults: MEDIATYPE=PLAIN", "@PJL SET MEDIATYPE=PLAIN" in L)
-check("defaults: TONERSAVE=OFF", "@PJL SET TONERSAVE=OFF" in L)
+check("defaults: ECONOMODE=OFF", "@PJL SET ECONOMODE=OFF" in L)
 check("defaults: no COPIES line", not any("COPIES" in l for l in L))
 
 rc, L = pjl("Duplex=DuplexNoTumble")
@@ -215,9 +215,9 @@ check("MediaType cannot inject PJL",
       and [l for l in L if l.startswith("@PJL SET DUPLEX")] == ["@PJL SET DUPLEX=OFF"], str(L))
 
 rc, L = pjl("TonerSave=True")
-check("tonersave on", "@PJL SET TONERSAVE=ON" in L)
+check("tonersave on", "@PJL SET ECONOMODE=ON" in L)
 rc, L = pjl("TonerSave=False")
-check("tonersave off", "@PJL SET TONERSAVE=OFF" in L)
+check("tonersave off", "@PJL SET ECONOMODE=OFF" in L)
 
 rc, L = pjl("", copies="7")
 check("copies 7", "@PJL SET COPIES=7" in L, str(L))

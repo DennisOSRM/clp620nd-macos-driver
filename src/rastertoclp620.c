@@ -333,7 +333,13 @@ int main(int argc, char *argv[])
             else if (!strcasecmp(slot, "Manual")) printf("@PJL SET MEDIASOURCE=MANUAL\r\n@PJL SET MANUALFEED=ON\r\n");
             else                                  printf("@PJL SET MEDIASOURCE=AUTO\r\n");
             printf("@PJL SET MEDIATYPE=%s\r\n", media);
-            printf("@PJL SET TONERSAVE=%s\r\n", tonersave ? "ON" : "OFF");
+            /*
+             * ECONOMODE, not TONERSAVE.  This firmware's INFO VARIABLES lists
+             * ECONOMODE and has no TONERSAVE at all, so the old spelling was
+             * accepted by the parser and then dropped on the floor - the PPD's
+             * Toner Save control did nothing whatsoever.
+             */
+            printf("@PJL SET ECONOMODE=%s\r\n", tonersave ? "ON" : "OFF");
             printf("@PJL ENTER LANGUAGE = PCL\r\n");
             fputs("\033E", stdout);
         }
