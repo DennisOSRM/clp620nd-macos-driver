@@ -18,11 +18,20 @@
  * every other state reason are passed through, which is the point of doing this
  * rather than switching SNMP off.
  *
+ * The same poll also forwards prtConsoleDisplayBufferText as a CUPS INFO line,
+ * so the queue shows what the panel shows, in the panel's own language, rather
+ * than a generic idle state; it is only re-sent when the text changes.  And it
+ * reads prtInputCurrentLevel, which reports 0 for an empty tray, purely to name
+ * the real cause in the debug line.  That reading never decides anything:
+ * prtAlertTable stays authoritative, because a tray with no level sensor
+ * answers -3 - Tray 1 here always does - and must not be read as "not empty".
+ *
  * Device URI: clp620://host[:port]  ->  socket://host[:port]
  *
  * SNMPv1 is spoken directly over UDP here.  Linking net-snmp would add a
  * dependency whose ABI moves between macOS releases, and it wants MIB files and
- * config the backend sandbox need not grant; one GETNEXT walk is not worth it.
+ * config the backend sandbox need not grant; three short GETNEXT walks on a
+ * five second cadence are not worth it.
  */
 
 #include <stdio.h>
@@ -53,6 +62,22 @@
 /* prtAlertCode and prtAlertDescription. */
 static const unsigned long OID_ALERT_CODE[] = { 1,3,6,1,2,1,43,18,1,1,7 };
 static const unsigned long OID_ALERT_DESC[] = { 1,3,6,1,2,1,43,18,1,1,8 };
+
+/*
+ * prtConsoleDisplayBufferText: the front panel's own text, one row per display
+ * line, already in whatever language the panel is set to.  Worth forwarding
+ * because it says what the machine says - "Sparbetrieb..." rather than a
+ * generic idle state.
+ */
+static const unsigned long OID_CONSOLE[] = { 1,3,6,1,2,1,43,16,5,1,2 };
+
+/*
+ * prtInputCurrentLevel, one row per tray.  0 means the tray is empty and -3
+ * means the tray has no level sensor to ask (Tray 1 on this printer reports
+ * -3 permanently; the multi-purpose tray reports 0 when empty, which is its
+ * normal resting state and the thing the firmware miscodes as a jam).
+ */
+static const unsigned long OID_INPUT_LEVEL[] = { 1,3,6,1,2,1,43,8,2,1,10 };
 
 static pid_t Child = 0;
 
@@ -224,11 +249,8 @@ static int oid_prefix(const unsigned long *base, size_t nbase,
  * the text is still caught.
  *   1 = a real jam, 0 = no jam, -1 = could not tell.
  */
-static int real_jam(const char *host, const char *community)
+static int real_jam(struct snmp *s)
 {
-    struct snmp s;
-    if (snmp_open(&s, host, community) < 0) return -1;
-
     int result = 0, answered = 0;
     unsigned char rbuf[2048];
 
@@ -243,7 +265,7 @@ static int real_jam(const char *host, const char *community)
         for (int step = 0; step < 64; step++) {
             unsigned long roid[64]; size_t nroid = 64;
             unsigned tag; const unsigned char *val; size_t vlen;
-            if (snmp_getnext(&s, cur, ncur, roid, &nroid, &tag, &val, &vlen,
+            if (snmp_getnext(s, cur, ncur, roid, &nroid, &tag, &val, &vlen,
                              rbuf, sizeof rbuf) < 0)
                 break;
             if (!oid_prefix(base, nbase, roid, nroid)) break;
@@ -265,8 +287,111 @@ static int real_jam(const char *host, const char *community)
         if (result) break;
     }
 
-    close(s.fd);
     return answered ? result : -1;
+}
+
+/*
+ * Copy the front panel's text into buf.  The table holds one row per display
+ * line and the firmware pads every line to the panel width, so rows are
+ * trimmed and joined with a single space.  Control bytes are dropped rather
+ * than forwarded: this string goes into a CUPS INFO line, and a stray newline
+ * there would be read as the start of another directive.
+ * Returns 1 if anything readable came back.
+ */
+static int console_text(struct snmp *s, char *buf, size_t buflen)
+{
+    unsigned char rbuf[2048];
+    unsigned long cur[64];
+    size_t nbase = sizeof OID_CONSOLE / sizeof *OID_CONSOLE, ncur = nbase;
+    size_t o = 0;
+    int answered = 0;
+
+    memcpy(cur, OID_CONSOLE, nbase * sizeof *cur);
+    buf[0] = '\0';
+
+    for (int step = 0; step < 8; step++) {
+        unsigned long roid[64]; size_t nroid = 64;
+        unsigned tag; const unsigned char *val; size_t vlen;
+        if (snmp_getnext(s, cur, ncur, roid, &nroid, &tag, &val, &vlen,
+                         rbuf, sizeof rbuf) < 0)
+            break;
+        if (!oid_prefix(OID_CONSOLE, nbase, roid, nroid)) break;
+        answered = 1;
+        if (tag == 0x04) {
+            size_t n = vlen;
+            while (n && (val[n-1] == ' ' || val[n-1] == '\t')) n--;
+            for (size_t i = 0; i < n && o + 2 < buflen; i++) {
+                unsigned char c = val[i];
+                if (c < 0x20 || c == 0x7f) continue;
+                if (c == ' ' && (o == 0 || buf[o-1] == ' ')) continue;
+                buf[o++] = (char)c;
+            }
+            if (o && o + 2 < buflen && buf[o-1] != ' ') buf[o++] = ' ';
+        }
+        memcpy(cur, roid, nroid * sizeof *cur);
+        ncur = nroid;
+    }
+    while (o && buf[o-1] == ' ') o--;
+    buf[o] = '\0';
+    return answered && o > 0;
+}
+
+/*
+ * Is some input tray empty?  This is corroboration, not the verdict: it says
+ * whether the condition the firmware miscodes as a jam is actually present, so
+ * the debug line can name the real cause.  prtAlertTable stays authoritative
+ * for whether there is a jam, because a tray that cannot report its level
+ * (-3, which is Tray 1 here always) must not be read as "not empty".
+ *   1 = at least one tray reads empty, 0 = none does, -1 = could not tell.
+ */
+static int tray_empty(struct snmp *s)
+{
+    unsigned char rbuf[2048];
+    unsigned long cur[64];
+    size_t nbase = sizeof OID_INPUT_LEVEL / sizeof *OID_INPUT_LEVEL, ncur = nbase;
+    int answered = 0, empty = 0;
+
+    memcpy(cur, OID_INPUT_LEVEL, nbase * sizeof *cur);
+
+    for (int step = 0; step < 16; step++) {
+        unsigned long roid[64]; size_t nroid = 64;
+        unsigned tag; const unsigned char *val; size_t vlen;
+        if (snmp_getnext(s, cur, ncur, roid, &nroid, &tag, &val, &vlen,
+                         rbuf, sizeof rbuf) < 0)
+            break;
+        if (!oid_prefix(OID_INPUT_LEVEL, nbase, roid, nroid)) break;
+        answered = 1;
+        if (tag == 0x02 && vlen) {
+            long v = (val[0] & 0x80) ? -1 : 0;          /* sign-extend */
+            for (size_t i = 0; i < vlen; i++) v = (v << 8) | val[i];
+            if (v == 0) empty = 1;
+        }
+        memcpy(cur, roid, nroid * sizeof *cur);
+        ncur = nroid;
+    }
+    return answered ? empty : -1;
+}
+
+struct printer_state {
+    int  jam;           /* 1 a real jam, 0 none, -1 could not tell   */
+    int  empty;         /* 1 a tray reads empty, 0 none, -1 unknown  */
+    char panel[160];    /* front-panel text, empty if unavailable    */
+};
+
+/* Everything the backend wants to know, over one socket rather than three. */
+static void probe_printer(const char *host, const char *community,
+                          struct printer_state *st)
+{
+    struct snmp s;
+
+    st->jam = st->empty = -1;
+    st->panel[0] = '\0';
+
+    if (snmp_open(&s, host, community) < 0) return;
+    st->jam   = real_jam(&s);
+    st->empty = tray_empty(&s);
+    console_text(&s, st->panel, sizeof st->panel);
+    close(s.fd);
 }
 
 /* -------------------------------------------------------------- main ---- */
@@ -380,24 +505,43 @@ int main(int argc, char *argv[])
     FILE *in = fdopen(pipefd[0], "r");
     char line[8192];
     time_t checked = 0;
-    int cached = -1;
+    struct printer_state st = { -1, -1, { 0 } };
+    char shown[sizeof st.panel];
+
+    shown[0] = '\0';
 
     while (in && fgets(line, sizeof line, in)) {
-        if (!strncmp(line, "STATE:", 6) && strstr(line, JAM_REASON)) {
-            time_t now = time(NULL);
-            if (cached < 0 || now - checked > 5) {      /* STATE lines repeat */
-                cached = real_jam(host, community);
-                checked = now;
+        int jamline = !strncmp(line, "STATE:", 6) && strstr(line, JAM_REASON);
+        time_t now = time(NULL);
+
+        /*
+         * One poll answers both questions.  It runs when a jam state needs
+         * deciding and nothing is cached, and otherwise on the same five
+         * second cadence the jam check always used, so the panel text keeps
+         * up on a job that never reports a jam at all.  STATE lines repeat
+         * far faster than that, which is what the cache is for.
+         */
+        if ((jamline && st.jam < 0) || now - checked > 5) {
+            probe_printer(host, community, &st);
+            checked = now;
+            if (st.panel[0] && strcmp(st.panel, shown)) {
+                snprintf(shown, sizeof shown, "%s", st.panel);
+                fprintf(stderr, "INFO: %s\n", st.panel);
             }
-            if (cached == 0) {
+        }
+
+        if (jamline) {
+            if (st.jam == 0) {
                 char before[8192];
                 snprintf(before, sizeof before, "%s", line);
                 if (filter_state(line)) {
                     char *nl = strchr(before, '\n'); if (nl) *nl = '\0';
                     fprintf(stderr, "DEBUG: clp620: suppressed \"%s\" - "
-                            "prtAlertTable reports no jam\n", before);
+                            "prtAlertTable reports no jam%s\n", before,
+                            st.empty == 1 ? ", and an input tray reads empty"
+                                          : "");
                 }
-            } else if (cached < 0) {
+            } else if (st.jam < 0) {
                 fputs("DEBUG: clp620: SNMP did not answer, passing the jam "
                       "state through unfiltered\n", stderr);
             }
