@@ -29,6 +29,25 @@ the printer-class bulk endpoints; nothing here needs libusb or Homebrew.  --net
 opens a socket to port 9100.  The printer takes the image identically on both,
 so if USB fights you over device claiming, the network path is the same flash.
 
+Checked against the vendor tool.  usblist2.exe finds the printer by the USB
+printer-class device interface GUID {28D78FAD-5A12-11D1-AE5B-0000F803A8C2} and
+opens it with CreateFileA - no spooler, no WritePrinter - which is the same
+endpoint the CUPS usb backend drives, so --usb is the equivalent path rather
+than an approximation.  Its transfer loop is ReadFile into a 0x1000-byte buffer
+then WriteFile of exactly what came back, repeated to end of file: no header is
+prepended, nothing is transformed, and nothing is read back from the device
+while the image is going out.  Hence the 4096-byte default block and the
+verbatim send here.  It also opens the device with share mode 0, holding it
+exclusively; the CUPS backend claims the interface the same way, which is why
+any queue on the device is disabled for the duration.
+
+One thing deliberately not copied: the image is sent once.  usblist2 wraps its
+transfer in an outer loop whose trip count could not be pinned down statically,
+so it may send the image twice.  The release note describes one drag-and-drop
+producing one update, and a second copy arriving while the printer is already
+rebooting into the new firmware is a worse failure than not sending it, so this
+sends once.
+
 Safety.  A truncated or mismatched image bricks the formatter, and the only
 recovery is reading flash off the board with a programmer.  So, before a byte
 moves: the image must carry a UEL header, must name a model that matches the
@@ -270,21 +289,36 @@ def send_net(data, ip, chunk):
 
 
 def pump(dst, data, chunk, is_socket=False):
+    """Write the image out in fixed-size blocks, checking every one landed.
+
+    usblist2.exe compares WriteFile's byte count against what it asked for and
+    stops with "Printer Error...!" if they differ, rather than carrying on and
+    leaving a hole in the middle of the flash.  Do the same: a short write here
+    is not something to retry around."""
     total, done, t0 = len(data), 0, time.time()
     while done < total:
         block = data[done:done + chunk]
         if is_socket:
-            dst.sendall(block)
+            dst.sendall(block)            # raises rather than writing short
+            n = len(block)
         else:
-            dst.write(block)
+            n = dst.write(block)
+            if n is None:                 # some file objects report nothing
+                n = len(block)
             dst.flush()
-        done += len(block)
-        pct = 100.0 * done / total
-        sys.stderr.write("\r  sending %6.1f%%  %s / %s" %
-                         (pct, human(done), human(total)))
+        if n != len(block):
+            sys.stderr.write("\n")
+            raise SystemExit(
+                "short write at offset %d: %d of %d bytes went out.\n"
+                "The image is now partly written.  Do NOT power the printer\n"
+                "off; re-run the same image before doing anything else."
+                % (done, n, len(block)))
+        done += n
+        sys.stderr.write("\r  sending %s / %s" % (format(done, ','),
+                                                  format(total, ',')))
         sys.stderr.flush()
     sys.stderr.write("\r  sent %s in %.1fs%s\n" %
-                     (human(total), time.time() - t0, ' ' * 20))
+                     (human(total), time.time() - t0, ' ' * 24))
 
 
 # ------------------------------------------------------------------ main ----
@@ -302,7 +336,9 @@ def main():
                     help='skip the typed confirmation (for scripting)')
     ap.add_argument('--skip-model-check', action='store_true',
                     help='flash even if the image names a different model')
-    ap.add_argument('--chunk', type=int, default=32768)
+    # usblist2.exe reads the image with ReadFile in 0x1000-byte blocks and
+    # hands each one straight to WriteFile, so use the same size.
+    ap.add_argument('--chunk', type=int, default=4096)
     a = ap.parse_args()
 
     use_usb = not a.net
