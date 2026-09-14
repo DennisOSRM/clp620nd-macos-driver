@@ -3,8 +3,10 @@
  *
  * The CLP-620ND's SNMP agent reports an empty input tray as a paper jam.
  * hrPrinterDetectedErrorState comes back as 04 00, which is bit 5, "jammed".
- * The bit it means is 13, "inputTrayEmpty", whose encoding is 00 04: the right
- * bit value written into the wrong octet.  The device's own prtAlertTable is
+ * The bit it means is 13, "inputTrayEmpty", whose encoding is 00 04: the two
+ * octets of the bitmap are written the wrong way round.  Out of paper entirely
+ * is 40 04, noPaper plus inputTrayEmpty, and arrives as 04 40 - jammed plus
+ * outputTrayMissing - so neither real bit survives.  The device's prtAlertTable is
  * correct at the same moment - it reports code 808, inputMediaSupplyEmpty, and
  * no jam - so the two disagree and only the bitmap is wrong.
  *
@@ -21,10 +23,10 @@
  * The same poll also forwards prtConsoleDisplayBufferText as a CUPS INFO line,
  * so the queue shows what the panel shows, in the panel's own language, rather
  * than a generic idle state; it is only re-sent when the text changes.  And it
- * reads prtInputCurrentLevel, which reports 0 for an empty tray, purely to name
- * the real cause in the debug line.  That reading never decides anything:
- * prtAlertTable stays authoritative, because a tray with no level sensor
- * answers -3 - Tray 1 here always does - and must not be read as "not empty".
+ * reads prtInputCurrentLevel, which answers -3 for a tray that holds paper
+ * without counting sheets and 0 for an empty one.  That names the real cause in
+ * the debug line, and drives the media-empty state below, but it never decides
+ * whether there is a jam: prtAlertTable stays authoritative for that.
  *
  * Device URI: clp620://host[:port]  ->  socket://host[:port]
  *
@@ -72,10 +74,10 @@ static const unsigned long OID_ALERT_DESC[] = { 1,3,6,1,2,1,43,18,1,1,8 };
 static const unsigned long OID_CONSOLE[] = { 1,3,6,1,2,1,43,16,5,1,2 };
 
 /*
- * prtInputCurrentLevel, one row per tray.  0 means the tray is empty and -3
- * means the tray has no level sensor to ask (Tray 1 on this printer reports
- * -3 permanently; the multi-purpose tray reports 0 when empty, which is its
- * normal resting state and the thing the firmware miscodes as a jam).
+ * prtInputCurrentLevel, one row per tray.  0 is empty; -3 means the tray holds
+ * paper but does not count sheets, which is what a loaded tray answers here.
+ * An empty multi-purpose tray is this printer's normal resting state, and is
+ * the condition the firmware miscodes as a jam.
  */
 static const unsigned long OID_INPUT_LEVEL[] = { 1,3,6,1,2,1,43,8,2,1,10 };
 
@@ -344,14 +346,15 @@ static int console_text(struct snmp *s, char *buf, size_t buflen)
  * (-3, which is Tray 1 here always) must not be read as "not empty".
  *   1 = at least one tray reads empty, 0 = none does, -1 = could not tell.
  */
-static int tray_empty(struct snmp *s)
+static int tray_empty(struct snmp *s, int *all_empty)
 {
     unsigned char rbuf[2048];
     unsigned long cur[64];
     size_t nbase = sizeof OID_INPUT_LEVEL / sizeof *OID_INPUT_LEVEL, ncur = nbase;
-    int answered = 0, empty = 0;
+    int answered = 0, empty = 0, trays = 0, empties = 0;
 
     memcpy(cur, OID_INPUT_LEVEL, nbase * sizeof *cur);
+    *all_empty = 0;
 
     for (int step = 0; step < 16; step++) {
         unsigned long roid[64]; size_t nroid = 64;
@@ -364,17 +367,20 @@ static int tray_empty(struct snmp *s)
         if (tag == 0x02 && vlen) {
             long v = (val[0] & 0x80) ? -1 : 0;          /* sign-extend */
             for (size_t i = 0; i < vlen; i++) v = (v << 8) | val[i];
-            if (v == 0) empty = 1;
+            trays++;
+            if (v == 0) { empty = 1; empties++; }
         }
         memcpy(cur, roid, nroid * sizeof *cur);
         ncur = nroid;
     }
+    if (trays && empties == trays) *all_empty = 1;
     return answered ? empty : -1;
 }
 
 struct printer_state {
     int  jam;           /* 1 a real jam, 0 none, -1 could not tell   */
     int  empty;         /* 1 a tray reads empty, 0 none, -1 unknown  */
+    int  all_empty;     /* 1 every tray that answered reads empty    */
     char panel[160];    /* front-panel text, empty if unavailable    */
 };
 
@@ -385,11 +391,12 @@ static void probe_printer(const char *host, const char *community,
     struct snmp s;
 
     st->jam = st->empty = -1;
+    st->all_empty = 0;
     st->panel[0] = '\0';
 
     if (snmp_open(&s, host, community) < 0) return;
     st->jam   = real_jam(&s);
-    st->empty = tray_empty(&s);
+    st->empty = tray_empty(&s, &st->all_empty);
     console_text(&s, st->panel, sizeof st->panel);
     close(s.fd);
 }
@@ -505,8 +512,9 @@ int main(int argc, char *argv[])
     FILE *in = fdopen(pipefd[0], "r");
     char line[8192];
     time_t checked = 0;
-    struct printer_state st = { -1, -1, { 0 } };
+    struct printer_state st = { -1, -1, 0, { 0 } };
     char shown[sizeof st.panel];
+    const char *empty_shown = NULL;
 
     shown[0] = '\0';
 
@@ -527,6 +535,34 @@ int main(int argc, char *argv[])
             if (st.panel[0] && strcmp(st.panel, shown)) {
                 snprintf(shown, sizeof shown, "%s", st.panel);
                 fprintf(stderr, "INFO: %s\n", st.panel);
+            }
+
+            /*
+             * Report the empty tray, which nothing else will.  The firmware
+             * writes hrPrinterDetectedErrorState with its two octets the wrong
+             * way round, so "out of paper" - noPaper in bit 1 and inputTrayEmpty
+             * in bit 13, which is 40 04 - goes out as 04 40 and arrives as
+             * jammed plus outputTrayMissing.  This backend then correctly drops
+             * the jam, and the queue is left saying nothing is wrong while the
+             * printer sits there with no paper in it.
+             *
+             * So say it here.  The tray level is the evidence: a tray with paper
+             * answers -3, meaning it holds some but does not count sheets, and
+             * only an empty one answers 0.  Every tray empty means printing has
+             * actually stopped, which is an error; one empty tray among several
+             * is a warning, because the job can still feed from another.
+             */
+            if (st.empty >= 0) {
+                const char *want = !st.empty      ? NULL
+                                 : st.all_empty   ? "media-empty-error"
+                                                  : "media-empty-warning";
+                if (want != empty_shown) {
+                    if (empty_shown)
+                        fprintf(stderr, "STATE: -%s\n", empty_shown);
+                    if (want)
+                        fprintf(stderr, "STATE: +%s\n", want);
+                    empty_shown = want;
+                }
             }
         }
 

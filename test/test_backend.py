@@ -127,6 +127,37 @@ check("no console/input table: no tray claim is made",
 check("no console/input table: no INFO invented",
       not [l for l in err.splitlines() if l.startswith("INFO:")], err)
 
+print("\n== the empty tray is reported, since nothing else reports it ==")
+with Agent("nopaper"):
+    rc, err = run()
+check("all trays empty -> media-empty-error",
+      "STATE: +media-empty-error" in states(err), str(states(err)))
+check("all trays empty -> not merely a warning",
+      "STATE: +media-empty-warning" not in states(err), str(states(err)))
+check("all trays empty -> the false jam is still dropped",
+      "STATE: -media-jam-warning" in states(err), str(states(err)))
+
+with Agent("nojam"):
+    rc, err = run()
+check("one tray empty -> media-empty-warning",
+      "STATE: +media-empty-warning" in states(err), str(states(err)))
+check("one tray empty -> not an error",
+      "STATE: +media-empty-error" not in states(err), str(states(err)))
+
+with Agent("allgood"):
+    rc, err = run()
+check("trays full -> no empty state invented",
+      not [l for l in states(err) if "media-empty" in l], str(states(err)))
+
+with Agent("nopanel"):
+    rc, err = run()
+check("no input table -> no empty state claimed",
+      not [l for l in states(err) if "media-empty" in l], str(states(err)))
+
+rc, err = run()
+check("SNMP silent -> no empty state claimed",
+      not [l for l in states(err) if "media-empty" in l], str(states(err)))
+
 print("\n== URI handling ==")
 with Agent("nojam"):
     rc, err = run()

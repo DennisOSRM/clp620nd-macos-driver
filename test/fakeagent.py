@@ -53,12 +53,14 @@ def parse_req(pkt):
     assert pkt[i] == 0x06; n, i = dec_len(pkt, i+1)
     return comm, reqid, dec_oid(pkt[i:i+n])
 
-# prtInputCurrentLevel: -3 is "no level sensor" (Tray 1 always answers this),
-# 0 is empty.  prtConsoleDisplayBufferText: one row per panel line, padded.
-TRAY_EMPTY = [((1,3,6,1,2,1,43,8,2,1,10,1,1), 0x02, -3),
-              ((1,3,6,1,2,1,43,8,2,1,10,1,2), 0x02, 0)]
+# prtInputCurrentLevel: -3 means the tray holds paper but does not count sheets,
+# 0 means empty.  prtConsoleDisplayBufferText: one row per panel line, padded.
+TRAY_EMPTY = [((1,3,6,1,2,1,43,8,2,1,10,1,1), 0x02, -3),   # Tray 1 has paper
+              ((1,3,6,1,2,1,43,8,2,1,10,1,2), 0x02, 0)]    # MP tray empty
 TRAY_FULL  = [((1,3,6,1,2,1,43,8,2,1,10,1,1), 0x02, -3),
               ((1,3,6,1,2,1,43,8,2,1,10,1,2), 0x02, 100)]
+TRAY_NONE  = [((1,3,6,1,2,1,43,8,2,1,10,1,1), 0x02, 0),    # both empty:
+              ((1,3,6,1,2,1,43,8,2,1,10,1,2), 0x02, 0)]    # printing stops
 PANEL      = [((1,3,6,1,2,1,43,16,5,1,2,1,1), 0x04, b"Sparbetrieb...  "),
               ((1,3,6,1,2,1,43,16,5,1,2,1,2), 0x04, b"                ")]
 PANEL_JAM  = [((1,3,6,1,2,1,43,16,5,1,2,1,1), 0x04, b"Papierstau      "),
@@ -88,6 +90,16 @@ SCENARIOS = {
   "evilpanel": [((1,3,6,1,2,1,43,18,1,1,7,1,1), 0x02, 808),
                 ((1,3,6,1,2,1,43,18,1,1,8,1,1), 0x04, b"Bypass Tray is empty.")]
                + TRAY_EMPTY + PANEL_EVIL,
+  # every tray empty: the firmware sends 04 40, which is 40 04 byte-swapped,
+  # so the real noPaper + inputTrayEmpty arrives as jammed + outputTrayMissing
+  "nopaper": [((1,3,6,1,2,1,43,18,1,1,7,1,1), 0x02, 808),
+              ((1,3,6,1,2,1,43,18,1,1,8,1,1), 0x04,
+               b"The machine is completely out of paper.")]
+             + TRAY_NONE + PANEL,
+  # trays full and no jam: nothing to report either way
+  "allgood": [((1,3,6,1,2,1,43,18,1,1,7,1,1), 0x02, 23),
+              ((1,3,6,1,2,1,43,18,1,1,8,1,1), 0x04, b"Power Saver Mode.")]
+             + TRAY_FULL + PANEL,
 }
 
 def main():
