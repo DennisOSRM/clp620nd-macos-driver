@@ -54,7 +54,8 @@ moves: the image must carry a UEL header, must name a model that matches the
 printer actually connected, and must be plausibly sized.  Any CUPS queue
 holding the same device is disabled for the duration and restored afterwards,
 because a print job arriving mid-write is exactly the collision that kills the
-board.  Nothing is sent without an explicit typed confirmation unless --force.
+board.  Nothing is sent until the warning banner has been answered with "yes";
+any other input aborts.  --force skips the prompt but still prints the banner.
 """
 import argparse, os, re, shutil, socket, subprocess, sys, time
 
@@ -333,7 +334,7 @@ def main():
     ap.add_argument('--dry-run', action='store_true',
                     help='validate the image and the device, send nothing')
     ap.add_argument('--force', action='store_true',
-                    help='skip the typed confirmation (for scripting)')
+                    help='answer the warning prompt automatically (scripting)')
     ap.add_argument('--skip-model-check', action='store_true',
                     help='flash even if the image names a different model')
     # usblist2.exe reads the image with ReadFile in 0x1000-byte blocks and
@@ -397,21 +398,33 @@ def main():
         print("\ndry run: the image and device validate.  Nothing was sent.")
         return 0
 
-    print("\n" + "=" * 68)
-    print("  A firmware write that is interrupted BRICKS the printer.")
-    print("  The only recovery is reading flash off the formatter board.")
-    print("  Do not power off the printer or unplug the cable until it has")
-    print("  finished rebooting on its own.  This can take several minutes,")
-    print("  and the panel may stay dark for part of it.")
-    print("=" * 68)
+    print("\n" + "=" * 70)
+    print("  WARNING - YOU ARE ON YOUR OWN FROM HERE")
+    print()
+    print("  This tool writes firmware into the printer.  It can brick it.")
+    print("  A write that is interrupted, or an image that is wrong for this")
+    print("  model, leaves a formatter board that will not boot.  The only")
+    print("  recovery is desoldering the flash chip and reading it back with")
+    print("  a programmer.  There is no software route out of that state.")
+    print()
+    print("  The checks this tool ran are not a guarantee.  Nothing here has")
+    print("  been tested against a real printer.")
+    print()
+    print("  Do not power the printer off and do not unplug the cable until")
+    print("  it has finished rebooting on its own.  That can take several")
+    print("  minutes, and the panel may stay dark for part of it.")
+    print()
+    print("  If anything goes wrong, it is your printer and your problem.")
+    print("=" * 70)
 
     if not a.force:
         try:
-            if input("\nType FLASH to proceed: ").strip() != 'FLASH':
-                print("aborted; nothing was sent.")
-                return 1
+            answer = input("\nType yes to continue, anything else aborts: ")
         except (EOFError, KeyboardInterrupt):
             print("\naborted; nothing was sent.")
+            return 1
+        if answer.strip().lower() != 'yes':
+            print("aborted; nothing was sent.")
             return 1
 
     for q in held:
