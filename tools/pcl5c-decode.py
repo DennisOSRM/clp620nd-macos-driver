@@ -76,6 +76,32 @@ def main():
         if kind == b'M':
             mode = val; continue
         chunk = data[pos:pos+val]; pos += val
+        if mode == 5:
+            # Adaptive: the transfer is a run of 3-byte-headed sub-blocks.
+            # Methods 0-3 carry one row; method 5 repeats the previous row and
+            # carries no data; method 4 would emit rows of zero bytes.
+            j = 0
+            while j + 3 <= len(chunk) and len(rows) < min(H, maxrows):
+                meth = chunk[j]
+                cnt  = (chunk[j+1] << 8) | chunk[j+2]
+                j += 3
+                if meth == 5:
+                    for _ in range(cnt):
+                        rows.append(prev)
+                    continue
+                if meth == 4:
+                    for _ in range(cnt):
+                        prev = bytes(rowbytes); rows.append(prev)
+                    continue
+                sub = chunk[j:j+cnt]; j += cnt
+                if meth == 0:   raw = sub.ljust(rowbytes, b'\0')[:rowbytes]
+                elif meth == 1: raw = sub.ljust(rowbytes, b'\0')[:rowbytes]
+                elif meth == 2: raw = unpack_packbits(sub, rowbytes)
+                elif meth == 3: raw = apply_delta(prev, sub, rowbytes)
+                else:           raw = bytes(rowbytes)
+                prev = raw
+                rows.append(raw)
+            continue
         if mode == 0:   raw = chunk.ljust(rowbytes, b'\0')[:rowbytes]
         elif mode == 2: raw = unpack_packbits(chunk, rowbytes)
         elif mode == 3: raw = apply_delta(prev, chunk, rowbytes)
