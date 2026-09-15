@@ -190,11 +190,12 @@ static size_t deltarow(const unsigned char *cur, const unsigned char *prev,
  * {0,3,0,8,8,8}) zero is black, not white.  It would paint solid black over
  * exactly the sparse pages it looks most attractive for.
  *
- * The firmware side of this was read out of the PCL5Ce interpreter rather than
- * assumed: its ESC*b#M dispatch gives modes 1, 2, 3 and 5 their own handlers
- * and sends 0 and 4 to a common "no decompressor" return, and modes 3 and 5 -
- * and only those two - pass the row length into the same seed-row allocator,
- * which is what delta row and adaptive both need.
+ * This printer's PCL5Ce parser accepts mode 5 (and rejects the reserved mode
+ * 4), which is the standard PCL5 set.  The option defaults to off regardless,
+ * because an unsupported mode is not rejected loudly: the parameter is dropped
+ * and the previous mode stays in force, so a printer without mode 5 would
+ * decode the sub-blocks as whatever mode was last set and print noise rather
+ * than failing the job.  Confirm on hardware before relying on it.
  */
 #define ADAPT_CHUNK   65536u    /* accumulate this much before one ESC*b#W   */
 #define ADAPT_MAXRUN  65535u    /* the sub-block count field is 16 bits      */
