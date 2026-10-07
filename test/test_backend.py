@@ -85,6 +85,79 @@ check("jam passed through when SNMP is silent",
       "STATE: +media-jam-warning" in states(err), str(states(err)))
 check("the fallback is logged", "SNMP did not answer" in err, err)
 
+print("\n== front-panel text is forwarded as INFO ==")
+with Agent("nojam"):
+    rc, err = run()
+infos = [l.strip() for l in err.splitlines() if l.startswith("INFO:")]
+check("panel text reaches CUPS as INFO",
+      any("Sparbetrieb..." in l for l in infos), str(infos))
+check("panel padding is trimmed",
+      not any(l.rstrip() != l or "   " in l for l in infos), str(infos))
+check("blank panel rows add nothing",
+      all(l.strip() != "INFO:" for l in infos), str(infos))
+check("panel text is sent once, not per line",
+      len([l for l in infos if "Sparbetrieb" in l]) == 1, str(infos))
+
+with Agent("jamcode"):
+    rc, err = run()
+infos = [l.strip() for l in err.splitlines() if l.startswith("INFO:")]
+check("both panel rows are joined",
+      any("Papierstau" in l and "Klappe oeffnen" in l for l in infos), str(infos))
+
+print("\n== a panel string cannot inject CUPS directives ==")
+with Agent("evilpanel"):
+    rc, err = run()
+check("control bytes are stripped from panel text",
+      not any(l.startswith("STATE:") and "+media-jam-warning" in l
+              for l in err.splitlines()[1:]), err)
+check("the evil line still produced one INFO",
+      any(l.startswith("INFO:") and "Ready" in l for l in err.splitlines()), err)
+
+print("\n== empty tray corroborates, but never decides ==")
+with Agent("nojam"):
+    rc, err = run()
+check("the empty tray is named in the debug line",
+      "an input tray reads empty" in err, err)
+with Agent("nopanel"):
+    rc, err = run()
+check("no console/input table: still suppresses on prtAlertTable alone",
+      "STATE: -media-jam-warning" in err, err)
+check("no console/input table: no tray claim is made",
+      "an input tray reads empty" not in err, err)
+check("no console/input table: no INFO invented",
+      not [l for l in err.splitlines() if l.startswith("INFO:")], err)
+
+print("\n== the empty tray is reported, since nothing else reports it ==")
+with Agent("nopaper"):
+    rc, err = run()
+check("all trays empty -> media-empty-error",
+      "STATE: +media-empty-error" in states(err), str(states(err)))
+check("all trays empty -> not merely a warning",
+      "STATE: +media-empty-warning" not in states(err), str(states(err)))
+check("all trays empty -> the false jam is still dropped",
+      "STATE: -media-jam-warning" in states(err), str(states(err)))
+
+with Agent("nojam"):
+    rc, err = run()
+check("one tray empty -> media-empty-warning",
+      "STATE: +media-empty-warning" in states(err), str(states(err)))
+check("one tray empty -> not an error",
+      "STATE: +media-empty-error" not in states(err), str(states(err)))
+
+with Agent("allgood"):
+    rc, err = run()
+check("trays full -> no empty state invented",
+      not [l for l in states(err) if "media-empty" in l], str(states(err)))
+
+with Agent("nopanel"):
+    rc, err = run()
+check("no input table -> no empty state claimed",
+      not [l for l in states(err) if "media-empty" in l], str(states(err)))
+
+rc, err = run()
+check("SNMP silent -> no empty state claimed",
+      not [l for l in states(err) if "media-empty" in l], str(states(err)))
+
 print("\n== URI handling ==")
 with Agent("nojam"):
     rc, err = run()

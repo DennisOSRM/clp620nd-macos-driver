@@ -3,8 +3,10 @@
  *
  * The CLP-620ND's SNMP agent reports an empty input tray as a paper jam.
  * hrPrinterDetectedErrorState comes back as 04 00, which is bit 5, "jammed".
- * The bit it means is 13, "inputTrayEmpty", whose encoding is 00 04: the right
- * bit value written into the wrong octet.  The device's own prtAlertTable is
+ * The bit it means is 13, "inputTrayEmpty", whose encoding is 00 04: the two
+ * octets of the bitmap are written the wrong way round.  Out of paper entirely
+ * is 40 04, noPaper plus inputTrayEmpty, and arrives as 04 40 - jammed plus
+ * outputTrayMissing - so neither real bit survives.  The device's prtAlertTable is
  * correct at the same moment - it reports code 808, inputMediaSupplyEmpty, and
  * no jam - so the two disagree and only the bitmap is wrong.
  *
@@ -18,11 +20,20 @@
  * every other state reason are passed through, which is the point of doing this
  * rather than switching SNMP off.
  *
+ * The same poll also forwards prtConsoleDisplayBufferText as a CUPS INFO line,
+ * so the queue shows what the panel shows, in the panel's own language, rather
+ * than a generic idle state; it is only re-sent when the text changes.  And it
+ * reads prtInputCurrentLevel, which answers -3 for a tray that holds paper
+ * without counting sheets and 0 for an empty one.  That names the real cause in
+ * the debug line, and drives the media-empty state below, but it never decides
+ * whether there is a jam: prtAlertTable stays authoritative for that.
+ *
  * Device URI: clp620://host[:port]  ->  socket://host[:port]
  *
  * SNMPv1 is spoken directly over UDP here.  Linking net-snmp would add a
  * dependency whose ABI moves between macOS releases, and it wants MIB files and
- * config the backend sandbox need not grant; one GETNEXT walk is not worth it.
+ * config the backend sandbox need not grant; three short GETNEXT walks on a
+ * five second cadence are not worth it.
  */
 
 #include <stdio.h>
@@ -53,6 +64,22 @@
 /* prtAlertCode and prtAlertDescription. */
 static const unsigned long OID_ALERT_CODE[] = { 1,3,6,1,2,1,43,18,1,1,7 };
 static const unsigned long OID_ALERT_DESC[] = { 1,3,6,1,2,1,43,18,1,1,8 };
+
+/*
+ * prtConsoleDisplayBufferText: the front panel's own text, one row per display
+ * line, already in whatever language the panel is set to.  Worth forwarding
+ * because it says what the machine says - "Sparbetrieb..." rather than a
+ * generic idle state.
+ */
+static const unsigned long OID_CONSOLE[] = { 1,3,6,1,2,1,43,16,5,1,2 };
+
+/*
+ * prtInputCurrentLevel, one row per tray.  0 is empty; -3 means the tray holds
+ * paper but does not count sheets, which is what a loaded tray answers here.
+ * An empty multi-purpose tray is this printer's normal resting state, and is
+ * the condition the firmware miscodes as a jam.
+ */
+static const unsigned long OID_INPUT_LEVEL[] = { 1,3,6,1,2,1,43,8,2,1,10 };
 
 static pid_t Child = 0;
 
@@ -224,11 +251,8 @@ static int oid_prefix(const unsigned long *base, size_t nbase,
  * the text is still caught.
  *   1 = a real jam, 0 = no jam, -1 = could not tell.
  */
-static int real_jam(const char *host, const char *community)
+static int real_jam(struct snmp *s)
 {
-    struct snmp s;
-    if (snmp_open(&s, host, community) < 0) return -1;
-
     int result = 0, answered = 0;
     unsigned char rbuf[2048];
 
@@ -243,7 +267,7 @@ static int real_jam(const char *host, const char *community)
         for (int step = 0; step < 64; step++) {
             unsigned long roid[64]; size_t nroid = 64;
             unsigned tag; const unsigned char *val; size_t vlen;
-            if (snmp_getnext(&s, cur, ncur, roid, &nroid, &tag, &val, &vlen,
+            if (snmp_getnext(s, cur, ncur, roid, &nroid, &tag, &val, &vlen,
                              rbuf, sizeof rbuf) < 0)
                 break;
             if (!oid_prefix(base, nbase, roid, nroid)) break;
@@ -265,8 +289,116 @@ static int real_jam(const char *host, const char *community)
         if (result) break;
     }
 
-    close(s.fd);
     return answered ? result : -1;
+}
+
+/*
+ * Copy the front panel's text into buf.  The table holds one row per display
+ * line and the firmware pads every line to the panel width, so rows are
+ * trimmed and joined with a single space.  Control bytes are dropped rather
+ * than forwarded: this string goes into a CUPS INFO line, and a stray newline
+ * there would be read as the start of another directive.
+ * Returns 1 if anything readable came back.
+ */
+static int console_text(struct snmp *s, char *buf, size_t buflen)
+{
+    unsigned char rbuf[2048];
+    unsigned long cur[64];
+    size_t nbase = sizeof OID_CONSOLE / sizeof *OID_CONSOLE, ncur = nbase;
+    size_t o = 0;
+    int answered = 0;
+
+    memcpy(cur, OID_CONSOLE, nbase * sizeof *cur);
+    buf[0] = '\0';
+
+    for (int step = 0; step < 8; step++) {
+        unsigned long roid[64]; size_t nroid = 64;
+        unsigned tag; const unsigned char *val; size_t vlen;
+        if (snmp_getnext(s, cur, ncur, roid, &nroid, &tag, &val, &vlen,
+                         rbuf, sizeof rbuf) < 0)
+            break;
+        if (!oid_prefix(OID_CONSOLE, nbase, roid, nroid)) break;
+        answered = 1;
+        if (tag == 0x04) {
+            size_t n = vlen;
+            while (n && (val[n-1] == ' ' || val[n-1] == '\t')) n--;
+            for (size_t i = 0; i < n && o + 2 < buflen; i++) {
+                unsigned char c = val[i];
+                if (c < 0x20 || c == 0x7f) continue;
+                if (c == ' ' && (o == 0 || buf[o-1] == ' ')) continue;
+                buf[o++] = (char)c;
+            }
+            if (o && o + 2 < buflen && buf[o-1] != ' ') buf[o++] = ' ';
+        }
+        memcpy(cur, roid, nroid * sizeof *cur);
+        ncur = nroid;
+    }
+    while (o && buf[o-1] == ' ') o--;
+    buf[o] = '\0';
+    return answered && o > 0;
+}
+
+/*
+ * Is some input tray empty?  This is corroboration, not the verdict: it says
+ * whether the condition the firmware miscodes as a jam is actually present, so
+ * the debug line can name the real cause.  prtAlertTable stays authoritative
+ * for whether there is a jam, because a tray that cannot report its level
+ * (-3, which is Tray 1 here always) must not be read as "not empty".
+ *   1 = at least one tray reads empty, 0 = none does, -1 = could not tell.
+ */
+static int tray_empty(struct snmp *s, int *all_empty)
+{
+    unsigned char rbuf[2048];
+    unsigned long cur[64];
+    size_t nbase = sizeof OID_INPUT_LEVEL / sizeof *OID_INPUT_LEVEL, ncur = nbase;
+    int answered = 0, empty = 0, trays = 0, empties = 0;
+
+    memcpy(cur, OID_INPUT_LEVEL, nbase * sizeof *cur);
+    *all_empty = 0;
+
+    for (int step = 0; step < 16; step++) {
+        unsigned long roid[64]; size_t nroid = 64;
+        unsigned tag; const unsigned char *val; size_t vlen;
+        if (snmp_getnext(s, cur, ncur, roid, &nroid, &tag, &val, &vlen,
+                         rbuf, sizeof rbuf) < 0)
+            break;
+        if (!oid_prefix(OID_INPUT_LEVEL, nbase, roid, nroid)) break;
+        answered = 1;
+        if (tag == 0x02 && vlen) {
+            long v = (val[0] & 0x80) ? -1 : 0;          /* sign-extend */
+            for (size_t i = 0; i < vlen; i++) v = (v << 8) | val[i];
+            trays++;
+            if (v == 0) { empty = 1; empties++; }
+        }
+        memcpy(cur, roid, nroid * sizeof *cur);
+        ncur = nroid;
+    }
+    if (trays && empties == trays) *all_empty = 1;
+    return answered ? empty : -1;
+}
+
+struct printer_state {
+    int  jam;           /* 1 a real jam, 0 none, -1 could not tell   */
+    int  empty;         /* 1 a tray reads empty, 0 none, -1 unknown  */
+    int  all_empty;     /* 1 every tray that answered reads empty    */
+    char panel[160];    /* front-panel text, empty if unavailable    */
+};
+
+/* Everything the backend wants to know, over one socket rather than three. */
+static void probe_printer(const char *host, const char *community,
+                          struct printer_state *st)
+{
+    struct snmp s;
+
+    st->jam = st->empty = -1;
+    st->all_empty = 0;
+    st->panel[0] = '\0';
+
+    if (snmp_open(&s, host, community) < 0) return;
+    st->jam   = real_jam(&s);
+    st->empty = tray_empty(&s, &st->all_empty);
+    console_text(&s, st->panel, sizeof st->panel);
+    close(s.fd);
 }
 
 /* -------------------------------------------------------------- main ---- */
@@ -380,24 +512,72 @@ int main(int argc, char *argv[])
     FILE *in = fdopen(pipefd[0], "r");
     char line[8192];
     time_t checked = 0;
-    int cached = -1;
+    struct printer_state st = { -1, -1, 0, { 0 } };
+    char shown[sizeof st.panel];
+    const char *empty_shown = NULL;
+
+    shown[0] = '\0';
 
     while (in && fgets(line, sizeof line, in)) {
-        if (!strncmp(line, "STATE:", 6) && strstr(line, JAM_REASON)) {
-            time_t now = time(NULL);
-            if (cached < 0 || now - checked > 5) {      /* STATE lines repeat */
-                cached = real_jam(host, community);
-                checked = now;
+        int jamline = !strncmp(line, "STATE:", 6) && strstr(line, JAM_REASON);
+        time_t now = time(NULL);
+
+        /*
+         * One poll answers both questions.  It runs when a jam state needs
+         * deciding and nothing is cached, and otherwise on the same five
+         * second cadence the jam check always used, so the panel text keeps
+         * up on a job that never reports a jam at all.  STATE lines repeat
+         * far faster than that, which is what the cache is for.
+         */
+        if ((jamline && st.jam < 0) || now - checked > 5) {
+            probe_printer(host, community, &st);
+            checked = now;
+            if (st.panel[0] && strcmp(st.panel, shown)) {
+                snprintf(shown, sizeof shown, "%s", st.panel);
+                fprintf(stderr, "INFO: %s\n", st.panel);
             }
-            if (cached == 0) {
+
+            /*
+             * Report the empty tray, which nothing else will.  The firmware
+             * writes hrPrinterDetectedErrorState with its two octets the wrong
+             * way round, so "out of paper" - noPaper in bit 1 and inputTrayEmpty
+             * in bit 13, which is 40 04 - goes out as 04 40 and arrives as
+             * jammed plus outputTrayMissing.  This backend then correctly drops
+             * the jam, and the queue is left saying nothing is wrong while the
+             * printer sits there with no paper in it.
+             *
+             * So say it here.  The tray level is the evidence: a tray with paper
+             * answers -3, meaning it holds some but does not count sheets, and
+             * only an empty one answers 0.  Every tray empty means printing has
+             * actually stopped, which is an error; one empty tray among several
+             * is a warning, because the job can still feed from another.
+             */
+            if (st.empty >= 0) {
+                const char *want = !st.empty      ? NULL
+                                 : st.all_empty   ? "media-empty-error"
+                                                  : "media-empty-warning";
+                if (want != empty_shown) {
+                    if (empty_shown)
+                        fprintf(stderr, "STATE: -%s\n", empty_shown);
+                    if (want)
+                        fprintf(stderr, "STATE: +%s\n", want);
+                    empty_shown = want;
+                }
+            }
+        }
+
+        if (jamline) {
+            if (st.jam == 0) {
                 char before[8192];
                 snprintf(before, sizeof before, "%s", line);
                 if (filter_state(line)) {
                     char *nl = strchr(before, '\n'); if (nl) *nl = '\0';
                     fprintf(stderr, "DEBUG: clp620: suppressed \"%s\" - "
-                            "prtAlertTable reports no jam\n", before);
+                            "prtAlertTable reports no jam%s\n", before,
+                            st.empty == 1 ? ", and an input tray reads empty"
+                                          : "");
                 }
-            } else if (cached < 0) {
+            } else if (st.jam < 0) {
                 fputs("DEBUG: clp620: SNMP did not answer, passing the jam "
                       "state through unfiltered\n", stderr);
             }

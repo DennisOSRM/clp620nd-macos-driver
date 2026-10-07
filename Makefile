@@ -44,6 +44,14 @@ probe:          ## dump printer config over PJL
 fsdump:         ## walk the printer's PJL filesystem (read-only)
 	./tools/pjl-fsdump.py $(PRINTER_IP)
 
+flash:          ## flash firmware over USB: make flash IMAGE=fw.hd  (DANGEROUS)
+	@test -n "$(IMAGE)" || { echo "usage: make flash IMAGE=firmware.hd"; exit 1; }
+	./tools/clp620-flash.py $(IMAGE) --usb
+
+flash-check:    ## validate an image and the device, send nothing
+	@test -n "$(IMAGE)" || { echo "usage: make flash-check IMAGE=firmware.hd"; exit 1; }
+	./tools/clp620-flash.py $(IMAGE) --usb --dry-run
+
 clean:
 	rm -f filter/rastertoclp620 backend/clp620 ppd/Samsung-CLP-620ND.ppd
 	rm -rf test/tmp

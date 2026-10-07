@@ -172,6 +172,67 @@ static size_t deltarow(const unsigned char *cur, const unsigned char *prev,
 }
 
 /*
+ * PCL adaptive compression, mode 5.  The payload of one ESC*b#W is a sequence
+ * of sub-blocks, each introduced by a three-byte header:
+ *
+ *     [method] [count high] [count low]
+ *
+ * For methods 0-3 the count is the number of data bytes that follow, and the
+ * sub-block carries one row.  For method 5 the count is a repeat count and no
+ * data follows at all: it replays the preceding row that many times.  That is
+ * the entire reason for using mode 5 here.  A 600 dpi A4 page is 7016 rows and
+ * the per-row "ESC*b0W" framing costs about 35 KB whatever the page contains -
+ * on a white page that is 95% of the output.  A run of identical rows collapses
+ * to three bytes.
+ *
+ * Method 4, "empty row", is deliberately never emitted.  An empty row is a row
+ * of zero bytes, and in the direct-RGB space this filter configures (CID
+ * {0,3,0,8,8,8}) zero is black, not white.  It would paint solid black over
+ * exactly the sparse pages it looks most attractive for.
+ *
+ * This printer's PCL5Ce parser accepts mode 5 (and rejects the reserved mode
+ * 4), which is the standard PCL5 set.  The option defaults to off regardless,
+ * because an unsupported mode is not rejected loudly: the parameter is dropped
+ * and the previous mode stays in force, so a printer without mode 5 would
+ * decode the sub-blocks as whatever mode was last set and print noise rather
+ * than failing the job.  Confirm on hardware before relying on it.
+ */
+#define ADAPT_CHUNK   65536u    /* accumulate this much before one ESC*b#W   */
+#define ADAPT_MAXRUN  65535u    /* the sub-block count field is 16 bits      */
+
+struct adapt {
+    unsigned char *buf;
+    size_t len, cap;
+    unsigned dup;               /* duplicate rows seen but not yet emitted   */
+};
+
+static void adapt_hdr(struct adapt *a, unsigned method, unsigned count)
+{
+    a->buf[a->len++] = (unsigned char)method;
+    a->buf[a->len++] = (unsigned char)(count >> 8);
+    a->buf[a->len++] = (unsigned char)(count & 0xff);
+}
+
+/* Emit the pending duplicate run, split to fit the 16-bit count field. */
+static void adapt_dupflush(struct adapt *a)
+{
+    while (a->dup) {
+        unsigned n = a->dup > ADAPT_MAXRUN ? ADAPT_MAXRUN : a->dup;
+        adapt_hdr(a, 5, n);
+        a->dup -= n;
+    }
+}
+
+/* Hand what has accumulated to the printer as one raster transfer. */
+static void adapt_emit(struct adapt *a)
+{
+    if (!a->len) return;
+    printf("\033*b%zuW", a->len);
+    fwrite(a->buf, 1, a->len, stdout);
+    a->len = 0;
+}
+
+/*
  * Source bytes per pixel for the colour spaces this filter converts.  Anything
  * not listed here is rejected in check_header() rather than silently turned
  * into a blank page.
@@ -258,12 +319,21 @@ int main(int argc, char *argv[])
     const char *o_slot     = cupsGetOption("InputSlot", num_options, options);
     const char *o_media    = cupsGetOption("MediaType", num_options, options);
     const char *o_tsave    = cupsGetOption("TonerSave", num_options, options);
+    const char *o_adapt    = cupsGetOption("AdaptiveCompression",
+                                           num_options, options);
 
     const char *media  = pjl_mediatype(o_media);
     const char *duplex = o_duplex ? o_duplex : "None";
     const char *slot   = o_slot   ? o_slot   : "Auto";
     int tonersave = o_tsave && (!strcasecmp(o_tsave, "True") ||
                                 !strcasecmp(o_tsave, "On"));
+    /*
+     * Off unless asked for.  Mode 5 was confirmed present by reading the
+     * interpreter's dispatch table, not by printing a page through it, so the
+     * conservative default stays until someone has seen it come out right.
+     */
+    int adaptive = o_adapt && (!strcasecmp(o_adapt, "True") ||
+                               !strcasecmp(o_adapt, "On"));
 
     struct sigaction action;
     memset(&action, 0, sizeof action);
@@ -283,6 +353,7 @@ int main(int argc, char *argv[])
     int page = 0, failed = 0, started = 0;
     unsigned char *line = NULL, *rgb = NULL, *comp = NULL, *prev = NULL, *dcomp = NULL;
     size_t linecap = 0, rgbcap = 0;
+    struct adapt ad = { NULL, 0, 0, 0 };
 
     while (!Canceled && !failed && cupsRasterReadHeader2(ras, &h)) {
         page++;
@@ -333,7 +404,13 @@ int main(int argc, char *argv[])
             else if (!strcasecmp(slot, "Manual")) printf("@PJL SET MEDIASOURCE=MANUAL\r\n@PJL SET MANUALFEED=ON\r\n");
             else                                  printf("@PJL SET MEDIASOURCE=AUTO\r\n");
             printf("@PJL SET MEDIATYPE=%s\r\n", media);
-            printf("@PJL SET TONERSAVE=%s\r\n", tonersave ? "ON" : "OFF");
+            /*
+             * ECONOMODE, not TONERSAVE.  This firmware's INFO VARIABLES lists
+             * ECONOMODE and has no TONERSAVE at all, so the old spelling was
+             * accepted by the parser and then dropped on the floor - the PPD's
+             * Toner Save control did nothing whatsoever.
+             */
+            printf("@PJL SET ECONOMODE=%s\r\n", tonersave ? "ON" : "OFF");
             printf("@PJL ENTER LANGUAGE = PCL\r\n");
             fputs("\033E", stdout);
         }
@@ -357,16 +434,34 @@ int main(int argc, char *argv[])
         }
         if (rgbn > rgbcap) {
             free(rgb); free(comp); free(prev); free(dcomp);
+            free(ad.buf);
             rgbcap = rgbn;
             rgb   = malloc(rgbn);
             comp  = malloc(rgbn + rgbn / 128 + 16);
             prev  = malloc(rgbn);
             dcomp = malloc(2 * rgbn + rgbn / 255 + 16);
+            /* room for a full chunk plus the one sub-block that overruns it */
+            ad.cap = ADAPT_CHUNK + 2 * rgbn + rgbn / 255 + 32;
+            ad.buf = malloc(ad.cap);
+            ad.len = ad.dup = 0;
         }
-        if (!line || !rgb || !comp || !prev || !dcomp) {
+        if (!line || !rgb || !comp || !prev || !dcomp || !ad.buf) {
             fputs("ERROR: rastertoclp620: out of memory\n", stderr);
             failed = 1;
             break;
+        }
+
+        /*
+         * A sub-block count is 16 bits, so a row whose compressed form could
+         * exceed 65535 bytes cannot be expressed in mode 5.  No paper this
+         * printer takes comes close - A4 at 600 dpi is 14880 bytes a row - but
+         * fall back rather than emit a truncated count if one ever did.
+         */
+        int use_adapt = adaptive;
+        if (use_adapt && rgbn + rgbn / 128 + 16 > ADAPT_MAXRUN) {
+            fputs("DEBUG: rastertoclp620: row too wide for adaptive "
+                  "compression, using per-row modes\n", stderr);
+            use_adapt = 0;
         }
 
         int curmode = -1;
@@ -374,7 +469,16 @@ int main(int argc, char *argv[])
             if (Canceled) break;
 
             if (y % BAND_ROWS == 0) {
-                if (y) fputs("\033*rC", stdout);        /* close previous band */
+                if (y) {
+                    /*
+                     * Nothing may straddle the band boundary: ESC*rC ends the
+                     * raster block and the next ESC*r1A reseeds the seed row,
+                     * so a duplicate run carried across would replay a row the
+                     * printer has already forgotten.
+                     */
+                    if (use_adapt) { adapt_dupflush(&ad); adapt_emit(&ad); }
+                    fputs("\033*rC", stdout);           /* close previous band */
+                }
                 unsigned rows = H - y < BAND_ROWS ? H - y : BAND_ROWS;
                 printf("\033*p0X\033*p%uY", y);         /* cursor to top of band */
                 printf("\033*r%uS", W);
@@ -382,6 +486,11 @@ int main(int argc, char *argv[])
                 fputs("\033*r1A", stdout);
                 curmode = -1;
                 memset(prev, 0, rgbn);                  /* each block reseeds from zero */
+                if (use_adapt) {
+                    fputs("\033*b5M", stdout);
+                    curmode = 5;
+                    ad.len = ad.dup = 0;
+                }
             }
 
             /*
@@ -437,22 +546,48 @@ int main(int argc, char *argv[])
                 }
             }
 
-            size_t np = packbits(rgb, rgbn, comp);
-            size_t nd = deltarow(rgb, prev, rgbn, dcomp);
-            if (nd <= np) {
-                if (curmode != 3) { fputs("\033*b3M", stdout); curmode = 3; }
-                printf("\033*b%zuW", nd);
-                if (nd) fwrite(dcomp, 1, nd, stdout);
+            if (use_adapt) {
+                /*
+                 * The first row of a band can never be a duplicate: no row has
+                 * been transferred into this raster block yet, so there is no
+                 * previous row for the printer to repeat.
+                 */
+                if (y % BAND_ROWS != 0 && !memcmp(rgb, prev, rgbn)) {
+                    ad.dup++;
+                } else {
+                    adapt_dupflush(&ad);
+                    size_t np = packbits(rgb, rgbn, comp);
+                    size_t nd = deltarow(rgb, prev, rgbn, dcomp);
+                    if (nd <= np) {
+                        adapt_hdr(&ad, 3, (unsigned)nd);
+                        memcpy(ad.buf + ad.len, dcomp, nd);
+                        ad.len += nd;
+                    } else {
+                        adapt_hdr(&ad, 2, (unsigned)np);
+                        memcpy(ad.buf + ad.len, comp, np);
+                        ad.len += np;
+                    }
+                }
+                if (ad.len >= ADAPT_CHUNK) adapt_emit(&ad);
             } else {
-                if (curmode != 2) { fputs("\033*b2M", stdout); curmode = 2; }
-                printf("\033*b%zuW", np);
-                fwrite(comp, 1, np, stdout);
+                size_t np = packbits(rgb, rgbn, comp);
+                size_t nd = deltarow(rgb, prev, rgbn, dcomp);
+                if (nd <= np) {
+                    if (curmode != 3) { fputs("\033*b3M", stdout); curmode = 3; }
+                    printf("\033*b%zuW", nd);
+                    if (nd) fwrite(dcomp, 1, nd, stdout);
+                } else {
+                    if (curmode != 2) { fputs("\033*b2M", stdout); curmode = 2; }
+                    printf("\033*b%zuW", np);
+                    fwrite(comp, 1, np, stdout);
+                }
             }
             memcpy(prev, rgb, rgbn);
         }
 
         if (failed || Canceled) break;
 
+        if (use_adapt) { adapt_dupflush(&ad); adapt_emit(&ad); }
         fputs("\033*rC", stdout);                       /* close last band */
         fputs("\014", stdout);                          /* eject */
     }
@@ -485,7 +620,7 @@ int main(int argc, char *argv[])
         failed = 1;
     }
 
-    free(line); free(rgb); free(comp); free(prev); free(dcomp);
+    free(line); free(rgb); free(comp); free(prev); free(dcomp); free(ad.buf);
     cupsRasterClose(ras);
     cupsFreeOptions(num_options, options);
     if (fd) close(fd);

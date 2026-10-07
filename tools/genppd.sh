@@ -157,6 +157,18 @@ cat <<'BODY'
 *TonerSave True/On: ""
 *CloseUI: *TonerSave
 
+*% PCL adaptive compression (mode 5).  Collapses runs of identical scan lines
+*% into a three-byte sub-block instead of one ESC*b0W each, which on a mostly
+*% white page is about 95% of the data sent.  Defaults off: the firmware was
+*% confirmed to implement mode 5 by reading its ESC*b#M dispatch table, not by
+*% printing through it, so the safe path stays the default until verified.
+*OpenUI *AdaptiveCompression/Adaptive Compression: PickOne
+*OrderDependency: 62 AnySetup *AdaptiveCompression
+*DefaultAdaptiveCompression: False
+*AdaptiveCompression False/Off: ""
+*AdaptiveCompression True/On: ""
+*CloseUI: *AdaptiveCompression
+
 *% Envelopes and transparencies cannot be duplexed; small media bypasses Tray 1.
 *% The envelope sizes are constrained by PageSize as well as by MediaType, so
 *% the restriction still applies when the media type is left at its default.

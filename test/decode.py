@@ -60,6 +60,29 @@ def parse(data):
         elif seq == (b'*', b'b', b'W'):
             chunk = data[i:i+val]; i += val
             nb = W*3
+            if mode == 5:
+                # Adaptive: a run of sub-blocks, each with a 3-byte header.
+                # Methods 0-3 carry one row, 4 emits rows of zero bytes, and 5
+                # repeats the previous row with no data of its own.
+                j = 0
+                while j + 3 <= len(chunk):
+                    meth = chunk[j]
+                    cnt  = (chunk[j+1] << 8) | chunk[j+2]
+                    j += 3
+                    if meth == 5:
+                        for _ in range(cnt):
+                            rows[ycur] = prev; ycur += 1
+                        continue
+                    if meth == 4:
+                        for _ in range(cnt):
+                            prev = bytes(nb); rows[ycur] = prev; ycur += 1
+                        continue
+                    sub = chunk[j:j+cnt]; j += cnt
+                    if meth == 3:   row = delta(prev, sub, nb)
+                    elif meth == 2: row = unpackbits(sub, nb)
+                    else:           row = sub.ljust(nb, b'\0')[:nb]
+                    rows[ycur] = row; prev = row; ycur += 1
+                continue
             if mode == 3:   row = delta(prev, chunk, nb)
             elif mode == 2: row = unpackbits(chunk, nb)
             else:           row = chunk.ljust(nb, b'\0')[:nb]
